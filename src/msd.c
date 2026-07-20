@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2011-2025 Rozhuk Ivan <rozhuk.im@gmail.com>
+ * Copyright (c) 2011-2026 Rozhuk Ivan <rozhuk.im@gmail.com>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -520,6 +520,7 @@ main(int argc, char *argv[]) {
 	const uint8_t *data;
 	size_t data_size;
 	tp_settings_t tp_s;
+	tp_params_t tp_prms;
 	http_srv_settings_t http_s;
 
 	error = read_file(cmd_line_data.cfg_file_name, 0, 0, 0,
@@ -556,18 +557,29 @@ main(int argc, char *argv[]) {
 		sys_res_limits_xml(data, data_size);
 	}
 
+	/* Thread pool. */
 	/* Thread pool settings. */
 	tp_settings_def(&tp_s);
 	if (0 == MSD_CFG_GET_VAL_DATA(NULL, &data, &data_size,
 	    "threadPool", NULL)) {
 		tp_settings_load_xml(data, data_size, &tp_s);
 	}
-	error = tp_create(&tp_s, &tp);
+	/* Params. */
+	memset(&tp_prms, 0x00, sizeof(tp_prms));
+	strlcpy(tp_prms.name, "Events pool", sizeof(tp_prms.name));
+	tp_prms.flags = TP_P_F_CLOEXEC;
+	error = tp_create(&tp_s, &tp_prms, &tp);
 	if (0 != error) {
 		SYSLOG_ERR(LOG_CRIT, error, "tp_create().");
 		goto err_out;
 	}
-	tp_threads_create(tp, 1);// XXX exit rewrite
+
+	/* Create and start threads. */
+	error = tp_threads_create(tp);
+	if (0 != error) {
+		SYSLOG_ERR(LOG_CRIT, error, "tp_threads_create().");
+		goto err_out;
+	}
 
 
 	error = str_hubs_bckt_create(tp, PACKAGE_NAME"/"PACKAGE_VERSION, &shbskt);
@@ -682,8 +694,10 @@ main(int argc, char *argv[]) {
 #endif
 
 	/* Receive and process packets. */
-	tp_thread_attach_first(g_data.tp);
-	tp_shutdown_wait(g_data.tp);
+	error = tp_shutdown_wait(g_data.tp);
+	if (0 != error) {
+		SYSLOG_ERR(LOG_ERR, error, "tp_shutdown_wait().");
+	}
 
 	/* Deinitialization... */
 	http_srv_shutdown(g_data.http_srv); /* No more new clients. */

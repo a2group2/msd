@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2012-2025 Rozhuk Ivan <rozhuk.im@gmail.com>
+ * Copyright (c) 2012-2026 Rozhuk Ivan <rozhuk.im@gmail.com>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -59,6 +59,7 @@
 #include "proto/http.h"
 #include "crypto/hash/md5.h"
 #include "utils/xml.h"
+#include "utils/strh2num.h"
 
 #include "stream_mpeg2ts.h"
 #include "stream_src.h"
@@ -729,11 +730,11 @@ str_src_start(str_src_p src) {
 			}
 		}
 		/* Tune socket. */
-		error = skt_opts_apply_ex(skt, SO_F_UDP_BIND_AF_MASK,
+		error = skt_opts_apply(skt, SO_F_UDP_BIND_AF_MASK,
 		    &s->skt_opts, conn_udp->addr.ss_family, NULL);
 		if (0 != error) {
 			SYSLOG_ERR(LOG_ERR, error,
-			    "skt_opts_apply_ex(SO_F_UDP_BIND_AF_MASK) fail.");
+			    "skt_opts_apply(SO_F_UDP_BIND_AF_MASK) fail.");
 			goto err_out;
 		}
 		/* Create IO task for socket. */
@@ -940,12 +941,12 @@ str_src_connected(tp_task_p tptask, int error, void *arg) {
 	}
 	/* Connected! */
 	/* Tune socket. */
-	error = skt_opts_apply_ex(tp_task_ident_get(tptask),
+	error = skt_opts_apply(tp_task_ident_get(tptask),
 	    (SO_F_TCP_ES_CONN_MASK & ~SO_F_HALFCLOSE_RDWR),
 	    &src->s.skt_opts, 0, NULL);
 	if (0 != error) {
 		SYSLOG_ERR(LOG_NOTICE, error,
-		    "skt_opts_apply_ex(SO_F_TCP_ES_CONN_MASK & ~SO_F_HALFCLOSE_RDWR) fail.");
+		    "skt_opts_apply(SO_F_TCP_ES_CONN_MASK & ~SO_F_HALFCLOSE_RDWR) fail.");
 		goto err_out;
 	}
 
@@ -1003,10 +1004,10 @@ err_out:
 	
 	tp_task_stop(tptask);
 
-	error = skt_opts_apply_ex(tp_task_ident_get(tptask),
+	error = skt_opts_apply(tp_task_ident_get(tptask),
 	    SO_F_HALFCLOSE_WR, &src->s.skt_opts, 0, NULL);
 	SYSLOG_ERR(LOG_NOTICE, error,
-	    "skt_opts_apply_ex(SO_F_HALFCLOSE_WR) fail, not fatal.");
+	    "skt_opts_apply(SO_F_HALFCLOSE_WR) fail, not fatal.");
 
 	/* Convert to "ready to read notifier". */
 	tp_task_tp_cb_func_set(tptask, tp_task_notify_handler);
@@ -1132,6 +1133,35 @@ err_out:
 
 rcv_next:
 	return (TP_TASK_CB_CONTINUE);
+}
+
+/* 
+ * HexNumCRLF
+ * dataCRLF
+ * HexNum
+ */
+static int
+http_data_chunked_size(const uint8_t *buf, const size_t buf_size,
+    size_t *chunk_size, size_t *chunk_marker_size) {
+	uint8_t *ptr_end;
+
+	if (NULL == buf || 5 > buf_size) /* 5 - min size: CRLF + num + CRLF */
+		return (EINVAL);
+	if ('\r' != buf[0] || '\n' != buf[1])
+		return (EINVAL);
+	ptr_end = mem_find_off(2, buf, buf_size, CRLF, 2);
+	if (NULL == ptr_end ||
+	    3 > (ptr_end - buf))
+		return (EINVAL);
+
+	if (NULL != chunk_size) {
+		(*chunk_size) = ustrh2usize((buf + 2), (size_t)((ptr_end - (buf + 2))));
+	}
+	if (NULL != chunk_marker_size) {
+		(*chunk_marker_size) = (size_t)((ptr_end - buf) + 2);
+	}
+
+	return (0);
 }
 
 static int

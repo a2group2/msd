@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2012-2024 Rozhuk Ivan <rozhuk.im@gmail.com>
+ * Copyright (c) 2012-2026 Rozhuk Ivan <rozhuk.im@gmail.com>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -894,9 +894,9 @@ str_hub_cli_attach(str_hub_p str_hub, str_hub_cli_p strh_cli) {
 
 	sa_addr_port_to_str(&strh_cli->remonte_addr, straddr, sizeof(straddr), NULL);
 	/* Tune socket. */
-	error = skt_opts_apply_ex(tp_task_ident_get(strh_cli->tptask),
+	error = skt_opts_apply(tp_task_ident_get(strh_cli->tptask),
 	    SO_F_TCP_ES_CONN_MASK, &str_hub->s.skt_opts, 0, NULL);
-	SYSLOG_ERR(LOG_WARNING, error, "%s - %s: skt_opts_apply_ex().",
+	SYSLOG_ERR(LOG_WARNING, error, "%s - %s: skt_opts_apply().",
 	    str_hub->name, straddr);
 	syslog(LOG_INFO,
 	    "%s - %s: attached, cli_count = %zu, snd_block_min_size = %zu, precache = %zu.",
