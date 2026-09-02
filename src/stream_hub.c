@@ -149,11 +149,11 @@ str_hub_tpt_get_by_name(tp_p tp, const uint8_t *name, size_t name_size) {
 	md5_get_digest((void*)name, name_size, hash);
 
 	thread_cnt = tp_thread_count_max_get(tp);
-	//thread_num = (/*(hash / thread_cnt) ^*/ (hash % thread_cnt));
-	thread_num = thread_cnt;
-	thread_num *= data_xor8(hash, sizeof(hash));
-	thread_num /= 256;
-	if (thread_cnt < thread_num)
+	if (0 == thread_cnt)
+		thread_cnt = 1;
+	/* Distribute hubs across all threads/cores uniformly by name hash. */
+	thread_num = (size_t)data_xor8(hash, sizeof(hash)) % thread_cnt;
+	if (thread_cnt <= thread_num)
 		thread_num = (thread_cnt - 1);
 
 	return (tp_thread_get(tp, thread_num));

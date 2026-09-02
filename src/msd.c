@@ -72,11 +72,32 @@
 
 
 
+/*
+ * Dynamic streamProxy route: maps a destination IP prefix to a sourceProfile
+ * so that /udp/, /rtp/ and /http/ requests matching dstPrefix/dstMask get the
+ * settings of that profile (e.g. different multicast ifName, socket options,
+ * ring buffer size). This allows distributing multicast streams across
+ * different network interfaces / CPUs.
+ */
+#define MSD_PROG_SERVICE_ROUTES_MAX	32
+typedef struct prog_service_route_s {
+	sockaddr_storage_t	dst;	/* Prefix (network) address. */
+	sockaddr_storage_t	mask;	/* Netmask. */
+	uint8_t			source_profile_name[128];
+	size_t			source_profile_name_size;
+} prog_service_route_t, *prog_service_route_p;
+
 typedef struct prog_service_s {
 	uint32_t		enabled;
 	str_hub_settings_t	hub_params; /* Stream hub params. */
 	str_src_settings_t	src_params; /* Stream hub source params. */
 	str_src_conn_params_t	src_conn_params; /* Stream hub source connection params. */
+	/* Optional custom hub profile name (for routes). */
+	uint8_t			hub_profile_name[128];
+	size_t			hub_profile_name_size;
+	/* Routes: dst prefix -> sourceProfile. */
+	prog_service_route_t	routes[MSD_PROG_SERVICE_ROUTES_MAX];
+	size_t			routes_count;
 } prog_service_t, *prog_service_p;
 
 /*
@@ -120,6 +141,11 @@ typedef struct prog_settings {
 	prog_service_t	multicast;
 	prog_service_t	http;
 	prog_service_t	transparent;
+
+	/* Config file buffer: needed to load sourceProfile on the fly for
+	 * streamProxy routes. */
+	const uint8_t	*cfg_file_buf;
+	size_t		cfg_file_buf_size;
 
 	/* Static channel definitions (from channelList) - to be able to
 	 * (re)create hubs on demand after they self-destroy. */
@@ -342,6 +368,52 @@ msd_prog_service_load(const uint8_t *buf, size_t buf_size, const char *name,
 			srv->src_conn_params.http.url_path = NULL;
 			srv->src_conn_params.http.url_path_size = 0;
 		}
+	}
+
+	/* Load optional routes: dst prefix -> sourceProfile. */
+	{
+		const uint8_t *route_pos = NULL;
+		const uint8_t *dst_data, *mask_data, *sp_data;
+		size_t route_i = 0, dst_size, mask_size, sp_size;
+		int r_has_dst, r_has_mask;
+		while (route_i < MSD_PROG_SERVICE_ROUTES_MAX &&
+		    0 == xml_get_val_args(buf, buf_size, &route_pos, NULL, NULL,
+		    &ptm, &tm, (const uint8_t*)"msd", "streamProxy", name,
+		    "route", NULL)) {
+			prog_service_route_p r = &srv->routes[route_i];
+			r_has_dst = (0 == xml_get_val_args(ptm, tm, NULL, NULL, NULL,
+			    &dst_data, &dst_size, (const uint8_t*)"dstPrefix", NULL));
+			r_has_mask = (0 == xml_get_val_args(ptm, tm, NULL, NULL, NULL,
+			    &mask_data, &mask_size, (const uint8_t*)"dstMask", NULL));
+			/* sourceProfileName is required. */
+			if (0 != xml_get_val_args(ptm, tm, NULL, NULL, NULL,
+			    &sp_data, &sp_size, (const uint8_t*)"sourceProfileName", NULL) ||
+			    !r_has_dst || 0 == dst_size ||
+			    sizeof(r->source_profile_name) <= sp_size)
+				continue;
+			if (0 != sa_addr_port_from_str(&r->dst, (char*)dst_data, dst_size))
+				continue;
+			if (r_has_mask && 0 < mask_size) {
+				if (0 != sa_addr_port_from_str(&r->mask, (char*)mask_data, mask_size))
+					continue;
+			} else { /* Default /32 (or /128 for v6). */
+				if (AF_INET6 == r->dst.ss_family) {
+					sa_init(&r->mask, AF_INET6, NULL, 0);
+					((struct sockaddr_in6*)&r->mask)->sin6_addr = in6addr_any;
+					/* full mask: set all bits */
+					memset(&((struct sockaddr_in6*)&r->mask)->sin6_addr, 0xff,
+					    sizeof(struct in6_addr));
+				} else {
+					sa_init(&r->mask, AF_INET, NULL, 0);
+					((struct sockaddr_in*)&r->mask)->sin_addr.s_addr =
+					    htonl(0xffffffff);
+				}
+			}
+			memcpy(r->source_profile_name, sp_data, sp_size);
+			r->source_profile_name_size = sp_size;
+			route_i ++;
+		}
+		srv->routes_count = route_i;
 	}
 
 	return (0);
@@ -697,6 +769,8 @@ main(int argc, char *argv[]) {
 	g_data.load_tmr.ident = (uintptr_t)&g_data;
 	g_data.load_tmr.ptr = cfg_file_buf;
 	g_data.load_tmr.size = cfg_file_buf_size;
+	g_data.cfg_file_buf = cfg_file_buf;
+	g_data.cfg_file_buf_size = cfg_file_buf_size;
 	error = tpt_ev_add_args(tp_thread_get(tp, 0), TP_EV_TIMER,
 	    TP_F_ONESHOT, TP_FF_T_MSEC, 100, &g_data.load_tmr);
 	if (0 != error) {
@@ -1343,6 +1417,112 @@ msd_http_srv_on_destroy_cb(http_srv_cli_p cli __unused, void *udata,
 
 /* http request from client is received now, process it. */
 /* http_srv_on_req_rcv_cb */
+
+/*
+ * Find streamProxy route matching the destination address.
+ * NULL if no route matches (use default sourceProfile).
+ */
+static prog_service_route_p
+msd_prog_service_route_find(const prog_service_p srv,
+    const sockaddr_storage_p dst) {
+	prog_service_route_p r;
+	size_t i;
+	uint8_t mb[sizeof(sockaddr_storage_t)], nb[sizeof(sockaddr_storage_t)];
+
+	if (NULL == srv || NULL == dst || 0 == srv->routes_count)
+		return (NULL);
+	for (i = 0; i < srv->routes_count; i ++) {
+		r = &srv->routes[i];
+		if (r->dst.ss_family != dst->ss_family)
+			continue;
+		/* Compare (dst & mask) == prefix. */
+		if (AF_INET == r->dst.ss_family) {
+			uint32_t a = ((const struct sockaddr_in*)dst)->sin_addr.s_addr;
+			uint32_t p = ((const struct sockaddr_in*)&r->dst)->sin_addr.s_addr;
+			uint32_t m = ((const struct sockaddr_in*)&r->mask)->sin_addr.s_addr;
+			if ((a & m) == (p & m))
+				return (r);
+		} else if (AF_INET6 == r->dst.ss_family) {
+			const uint8_t *a = ((const struct sockaddr_in6*)dst)->sin6_addr.s6_addr;
+			const uint8_t *p = ((const struct sockaddr_in6*)&r->dst)->sin6_addr.s6_addr;
+			const uint8_t *m = ((const struct sockaddr_in6*)&r->mask)->sin6_addr.s6_addr;
+			size_t k;
+			for (k = 0; k < 16; k ++) {
+				if (((a[k] & m[k]) != (p[k] & m[k])))
+					break;
+			}
+			if (16 == k)
+				return (r);
+		} else { /* Fallback: compare masked raw bytes. */
+			size_t asz = sa_size(dst);
+			memcpy(mb, &r->mask, sizeof(mb));
+			memcpy(nb, dst, sizeof(nb));
+			for (i = 0; i < asz; i ++)
+				mb[i] &= nb[i];
+			if (0 == memcmp(mb, &r->dst, asz))
+				return (r);
+		}
+	}
+	return (NULL);
+}
+
+/*
+ * If a route matches the request's destination address, reload
+ * src_params / src_conn_params (and hub params) from the route's
+ * sourceProfile, so that dynamic /udp/, /rtp/ and /http/ requests can use
+ * different interfaces/settings per address prefix.
+ * Returns 0 and sets *srv_ret to the (stack-allocated, caller-owned)
+ * temporary service if route matched; otherwise *srv_ret = srv.
+ */
+static int
+msd_prog_service_route_apply(prog_service_p srv, uint32_t src_type,
+    const sockaddr_storage_p dst, prog_service_p *srv_ret,
+    prog_service_t *tmp_srv) {
+	prog_service_route_p r;
+	int error;
+
+	if (NULL == srv || NULL == srv_ret || NULL == tmp_srv || NULL == dst) {
+		if (NULL != srv_ret)
+			(*srv_ret) = srv;
+		return (0);
+	}
+	r = msd_prog_service_route_find(srv, dst);
+	if (NULL == r) {
+		(*srv_ret) = srv;
+		return (0);
+	}
+	/* Build temporary service copying base settings and loading the
+	 * route's sourceProfile over the default one. */
+	memset(tmp_srv, 0x00, sizeof(*tmp_srv));
+	tmp_srv->enabled = srv->enabled;
+	/* Deep copy base hub params (includes str_src_settings deep copy and
+	 * cust_http_hdrs deep copy). */
+	error = str_hub_settings_copy(&tmp_srv->hub_params, &srv->hub_params);
+	if (0 != error) {
+		(*srv_ret) = srv;
+		return (error);
+	}
+	/* Load named source profile on top (as hub source defaults). */
+	error = msd_src_profile_load(g_data.cfg_file_buf, g_data.cfg_file_buf_size,
+	    r->source_profile_name, r->source_profile_name_size,
+	    src_type, &tmp_srv->hub_params.str_src_settings);
+	/* Copy source params for the source that will be created. */
+	str_src_settings_copy(&tmp_srv->src_params,
+	    &tmp_srv->hub_params.str_src_settings);
+	str_src_conn_def(src_type, &tmp_srv->src_conn_params);
+	error = msd_src_conn_profile_load(g_data.cfg_file_buf, g_data.cfg_file_buf_size,
+	    r->source_profile_name, r->source_profile_name_size,
+	    src_type, &tmp_srv->src_conn_params);
+	if (STR_SRC_TYPE_TCP_HTTP == src_type) {
+		tmp_srv->src_conn_params.tcp.host = NULL;
+		tmp_srv->src_conn_params.tcp.host_size = 0;
+		tmp_srv->src_conn_params.http.url_path = NULL;
+		tmp_srv->src_conn_params.http.url_path_size = 0;
+	}
+	(*srv_ret) = tmp_srv;
+	return (0);
+}
+
 int
 msd_http_srv_on_req_rcv_cb(http_srv_cli_p cli, void *udata __unused,
     http_srv_req_p req, http_srv_resp_p resp) {
@@ -1354,6 +1534,10 @@ msd_http_srv_on_req_rcv_cb(http_srv_cli_p cli, void *udata __unused,
 	prog_service_p prog_service = NULL;
 	str_src_settings_p src_params;
 	str_src_conn_params_p src_conn_params;
+prog_service_t tmp_prog_service; /* Route selected profile (stack). */
+	sockaddr_storage_t routed_dst;
+	int route_used = 0;
+	prog_service_p prog_service_active = NULL;
 	static const char *cttype = 	"Content-Type: text/plain\r\n"
 					"Pragma: no-cache";
 
@@ -1418,14 +1602,15 @@ msd_http_srv_on_req_rcv_cb(http_srv_cli_p cli, void *udata __unused,
 		src_type = STR_SRC_TYPE_MULTICAST;
 		prog_service = &g_data.multicast;
 handle_dyn_client:
+		prog_service_active = prog_service;
 		if (HTTP_REQ_METHOD_HEAD == req->line.method_code) { /* HEAD allways return 200 OK. */
 			/* Send HTTP headers only... */
 			resp->status_code = 200;
 			resp->p_flags &= ~HTTP_SRV_RESP_P_F_CONTENT_LEN;
-			if (6 < prog_service->hub_params.cust_http_hdrs_size) {
+			if (6 < prog_service_active->hub_params.cust_http_hdrs_size) {
 				resp->hdrs_count = 1;
-				resp->hdrs[0].iov_base = prog_service->hub_params.cust_http_hdrs;
-				resp->hdrs[0].iov_len = prog_service->hub_params.cust_http_hdrs_size;
+				resp->hdrs[0].iov_base = prog_service_active->hub_params.cust_http_hdrs;
+				resp->hdrs[0].iov_len = prog_service_active->hub_params.cust_http_hdrs_size;
 			}
 			return (HTTP_SRV_CB_CONTINUE);
 		}
@@ -1452,6 +1637,23 @@ err_out_dyn_client:
 			    buf, sizeof(buf), &buf_size);
 			if (200 != resp->status_code)
 				goto err_out_dyn_client;
+			/* Apply route: choose sourceProfile by destination address. */
+			{
+				uint32_t mc_if_index = src_conn_params->mc.if_index;
+				uint32_t mc_rejoin = src_conn_params->mc.rejoin_time;
+				memcpy(&routed_dst, &src_conn_params->udp.addr, sizeof(routed_dst));
+				msd_prog_service_route_apply(prog_service, src_type,
+				    &routed_dst, &prog_service_active, &tmp_prog_service);
+				route_used = (prog_service_active != prog_service);
+				/* Reload source params from selected profile. */
+				str_src_settings_copy(src_params, &prog_service_active->src_params);
+				memcpy(src_conn_params, &prog_service_active->src_conn_params,
+				    sizeof(str_src_conn_params_t));
+				/* Restore parsed destination. */
+				memcpy(&src_conn_params->udp.addr, &routed_dst, sizeof(routed_dst));
+				src_conn_params->mc.if_index = mc_if_index;
+				src_conn_params->mc.rejoin_time = mc_rejoin;
+			}
 		} else {
 			/* Get dst ip address, host name, hub name. */
 			resp->status_code = msd_http_req_url_parse(
@@ -1462,6 +1664,21 @@ err_out_dyn_client:
 			    buf, sizeof(buf), &buf_size);
 			if (200 != resp->status_code)
 				goto err_out_dyn_client;
+			/* Apply route: choose sourceProfile by destination address. */
+			{
+				memcpy(&routed_dst, &src_conn_params->tcp.addr[0], sizeof(routed_dst));
+				msd_prog_service_route_apply(prog_service, src_type,
+				    &routed_dst, &prog_service_active, &tmp_prog_service);
+				route_used = (prog_service_active != prog_service);
+				/* Reload source params from selected profile. */
+				str_src_settings_copy(src_params, &prog_service_active->src_params);
+				memcpy(src_conn_params, &prog_service_active->src_conn_params,
+				    sizeof(str_src_conn_params_t));
+				/* Restore parsed destination - the http request generation
+				 * below uses str_addr/str_addr_size (into req_buf), so
+				 * nothing else to restore here. */
+				memcpy(&src_conn_params->tcp.addr[0], &routed_dst, sizeof(routed_dst));
+			}
 			/* Generate http request */
 			ptm = (str_addr + str_addr_size + 1); /* URL path */
 			if (0 != req->line.query_size) {
@@ -1486,14 +1703,20 @@ err_out_dyn_client:
 			}
 		}
 		/* Default value. */
-		str_src_settings_copy(src_params, &prog_service->src_params);
+		str_src_settings_copy(src_params, &prog_service_active->src_params);
 		src_params->src_conn_params = src_conn_params;
 		if (0 != msd_hub_attach_cli(g_data.shbskt, buf, buf_size,
 		    cli, STR_HUB_CLI_ST_NONE,
-		    &prog_service->hub_params, src_type,
+		    &prog_service_active->hub_params, src_type,
 		    src_params)) {
 			resp->status_code = 500;
 			goto err_out_dyn_client;
+		}
+		/* Route temp service cleanup. */
+		if (0 != route_used) {
+			str_src_settings_free_data(&tmp_prog_service.src_params);
+			str_hub_settings_free_data(&tmp_prog_service.hub_params);
+			route_used = 0;
 		}
 		/* Will send reply later... */
 		return (HTTP_SRV_CB_NONE);
