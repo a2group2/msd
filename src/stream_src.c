@@ -945,7 +945,18 @@ str_src_connected(tp_task_p tptask, int error, void *arg) {
 	SYSLOGD_EX(LOG_DEBUG, "...");
 
 	if (0 != error) { /* Fail to connect. */
-		SYSLOG_ERR_EX(LOG_ERR, error, "...");
+		char straddr[STR_ADDR_LEN];
+		str_src_conn_tcp_p conn_tcp;
+
+		conn_tcp = &src->s.src_conn_params->tcp;
+		if (0 == sa_addr_port_to_str(
+		    &conn_tcp->addr[conn_tcp->addr_index],
+		    straddr, sizeof(straddr), NULL)) {
+			SYSLOG_ERR_EX(LOG_ERR, error, "Connect to %s fail.",
+			    straddr);
+		} else {
+			SYSLOG_ERR_EX(LOG_ERR, error, "...");
+		}
 		str_src_connect_retry(src);
 		src->last_err = error;
 		return (0);
