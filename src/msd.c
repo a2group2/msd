@@ -1283,6 +1283,20 @@ http_hub_name_gen_bin_addr:
 			memcpy((hub_name + tm), (ptm + 1), tm2);
 			tm += tm2;
 		}
+		/* Include query string: each unique request URI (path + ?query) must
+		 * map to a distinct stream hub. Otherwise "?id=XXX" is ignored when
+		 * building the hub name, and requests with different ids (different
+		 * channels) share the same hub, replaying the first created stream. */
+		if (0 != req->line.query_size) {
+			tm2 = MIN((req->line.query_size + 1),
+			    (hub_name_size - (tm + 4)));
+			if (1 < tm2) { /* Need at least space for "?x". */
+				hub_name[tm ++] = '?';
+				tm2 --;
+				memcpy((hub_name + tm), req->line.query, tm2);
+				tm += tm2;
+			}
+		}
 		hub_name[tm] = 0;
 		if (NULL != str_addr) {
 			(*str_addr) = (req->line.abs_path + 6);
