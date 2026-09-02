@@ -1127,7 +1127,17 @@ err_out_dyn_client:
 				goto err_out_dyn_client;
 			/* Generate http request */
 			ptm = (str_addr + str_addr_size + 1); /* URL path */
-			tm = (size_t)(req->line.abs_path_size - (size_t)(ptm - req->line.abs_path));
+			if (0 != req->line.query_size) {
+				/* Include query string ("?id=...") after the path:
+				 * http_parse_req_line() splits it out of abs_path,
+				 * but the upstream source (e.g. Acestream getstream)
+				 * needs the whole request URI including the query. */
+				tm = (size_t)((req->line.query +
+				    req->line.query_size) - ptm);
+			} else {
+				tm = (size_t)((req->line.abs_path +
+				    req->line.abs_path_size) - ptm);
+			}
 			error = str_src_conn_http_gen_request(str_addr, str_addr_size,
 			    ptm, tm,  NULL, 0, &src_conn_params->http);
 			if (0 != error) {
