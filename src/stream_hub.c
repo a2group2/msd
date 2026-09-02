@@ -1311,21 +1311,14 @@ send_start:
 				    "%s - %s: Drop lagged client, dropped = %zu.",
 				    str_hub->name, straddr, drop_size);
 				return (ESPIPE); /* Destroy me. */
-			} else {
-				sa_addr_port_to_str(&strh_cli->remonte_addr, straddr, sizeof(straddr), NULL);
-				syslog(LOG_INFO,
-				    "%s - %s: Restart lagged client, dropped = %zu.",
-				    str_hub->name, straddr, drop_size);
-				/* Reset state flags to restart client. */
-				strh_cli->state &= ~(
-				    STR_HUB_CLI_STATE_F_MPEG2TS_HDRS_SENDED |
-				    STR_HUB_CLI_STATE_F_RPOS_INITIALIZED |
-				    STR_HUB_CLI_STATE_F_PRECACHE_DONE);
-				loop_cnt ++;
-				if (1 < loop_cnt)
-					return (0); /* Avoid loop. */
-				goto send_start;
 			}
+			/* Slow reader: r_buf_data_avail_size() already moved rpos to
+			 * the actual (tail) position (r_buf_rpos_check()), so there
+			 * is nothing to read for now. Do NOT reset the client state /
+			 * precache / re-send MPEG2TS headers: that would cause the
+			 * player to "blink" on every stall. Just continue and send
+			 * from the new position on the next call. */
+			goto send_done;
 		}
 	}
 	if (strh_cli->snd_block_min_size > data_avail2send)
