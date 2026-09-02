@@ -1072,6 +1072,8 @@ str_src_http_redirect_follow(str_src_p src, const uint8_t *location,
 	sockaddr_storage_t addr;
 	int error;
 
+	uint16_t def_port, cur_port;
+
 	if (NULL == src || NULL == location || 0 == location_size)
 		return (EINVAL);
 	if (STR_SRC_HTTP_MAX_REDIRECTS <= src->http_redirect_count) {
@@ -1082,6 +1084,17 @@ str_src_http_redirect_follow(str_src_p src, const uint8_t *location,
 
 	conn_http = &src->s.src_conn_params->http;
 	conn_tcp = &conn_http->tcp;
+
+	/* Acestream and some other engines omit ":port" in the Location
+	 * header and mean "the same port the request was made to". Use the
+	 * current source port as default, fall back to 80 (HTTP default). */
+	def_port = HTTP_PORT;
+	if (conn_tcp->addr_count > 0 &&
+	    conn_tcp->addr_index < conn_tcp->addr_count) {
+		cur_port = sa_port_get(&conn_tcp->addr[conn_tcp->addr_index]);
+		if (0 != cur_port)
+			def_port = cur_port;
+	}
 
 	skip_spwsp2(location, location_size, &location, &location_size);
 	if (0 == location_size || NULL == location)
@@ -1147,12 +1160,12 @@ str_src_http_redirect_follow(str_src_p src, const uint8_t *location,
 	conn_tcp->addr_index = 0;
 	if (0 == sa_addr_port_from_str(&addr, (const char*)host_buf, host_size)) {
 		if (0 == sa_port_get(&addr)) {
-			sa_port_set(&addr, HTTP_PORT);
+			sa_port_set(&addr, def_port);
 		}
 		memcpy(&conn_tcp->addr[0], &addr, sizeof(addr));
 		conn_tcp->addr_count = 1;
 	} else { /* Not a literal address: try DNS resolve. */
-		haddr = host_addr_alloc(host_buf, host_size, HTTP_PORT);
+		haddr = host_addr_alloc(host_buf, host_size, def_port);
 		if (NULL == haddr)
 			return (ENOMEM);
 		if (0 != host_addr_resolv(haddr) || 0 == haddr->count) {
@@ -1202,10 +1215,16 @@ str_src_recv_http_cb(tp_task_p tptask, int error, uint32_t eof,
 	const uint8_t *te, *location;
 	size_t transfered_size = 0, buf_size, te_size, location_size;
 	http_resp_line_data_t resp_data;
+	int resp_parsed = 0;
 
 	SYSLOGD_EX(LOG_DEBUG, "...");
 
-	if (0 != error || 0 != eof) {
+	/* NOTE: 'eof' alone must not abort header parsing: a source may
+	 * answer with a redirect (3xx) and immediately close the connection
+	 * (typical for Acestream getstream), so we still must read and parse
+	 * the pending response before deciding to stop. A real socket error
+	 * (non eof) still aborts right away. */
+	if (0 != error && 0 == eof) {
 err_out:
 		SYSLOG_ERR(LOG_DEBUG, error, "On receive.");
 		if (0 != eof) {
@@ -1229,7 +1248,10 @@ err_out:
 	}
 
 	ident = tp_task_ident_get(tptask);
-	while (transfered_size < data2transfer_size) { /* recv loop. */
+	/* NOTE: run the recv loop even when eof is set: server may have
+	 * sent the response and then closed the connection, and the data is
+	 * still waiting for us in the socket buffer. */
+	while (transfered_size < data2transfer_size || 0 != eof) { /* recv loop. */
 		/* r_buf handles inside data move from tail to head on round 
 		 * complete, so r_buf_w_off is always valid. */
 		buf_size = r_buf_wbuf_get(src->r_buf,
@@ -1244,8 +1266,10 @@ err_out:
 			error = SKT_ERR_FILTER(error);
 			break;
 		}
-		if (0 == ios)
+		if (0 == ios) { /* EOF - no more data. */
+			eof = 1;
 			break;
+		}
 		transfered_size += (size_t)ios;
 		src->r_buf_w_off += (size_t)ios;
 		ptm = mem_find_cstr(buf, src->r_buf_w_off, CRLFCRLF);
@@ -1256,6 +1280,12 @@ err_out:
 		if (0 != error)
 			break;
 		src->http_resp_code = resp_data.status_code;
+		if (300 <= resp_data.status_code) {
+			syslog(LOG_INFO, "HTTP source resp: status %"PRIu32" %.*s",
+			    resp_data.status_code,
+			    (int)resp_data.reason_phrase_size,
+			    resp_data.reason_phrase);
+		}
 		/* HTTP redirect (301, 302, 303, 307, 308) support. */
 		if (0 != str_src_http_redirect_is_code(resp_data.status_code)) {
 			if (0 != http_hdr_val_get(buf, (size_t)(ptm - buf),
@@ -1306,6 +1336,7 @@ err_out:
 		    "\n%.*s"
 		    "\n===========================================",
 		    src->r_buf_w_off, ios, (int)(ptm - buf),buf);
+		resp_parsed = 1;
 		/* Remove HTTP header. */
 		src->r_buf_w_off -= (ptm - buf);
 		memmove(buf, ptm, src->r_buf_w_off);
@@ -1318,6 +1349,13 @@ err_out:
 		src->last_err = error;
 		if (0 == transfered_size)
 			goto rcv_next;
+	}
+	/* EOF with no HTTP response parsed: source closed connection without
+	 * data (or without anything we could use), treat as error. */
+	if (0 != eof && 0 == resp_parsed) {
+		if (0 == error)
+			error = ECONNRESET;
+		goto err_out;
 	}
 	/* Calc speed. */
 	src->received_count += transfered_size;
