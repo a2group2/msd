@@ -1312,12 +1312,17 @@ send_start:
 				    str_hub->name, straddr, drop_size);
 				return (ESPIPE); /* Destroy me. */
 			}
-			/* Slow reader: r_buf_data_avail_size() already moved rpos to
-			 * the actual (tail) position (r_buf_rpos_check()), so there
-			 * is nothing to read for now. Do NOT reset the client state /
-			 * precache / re-send MPEG2TS headers: that would cause the
-			 * player to "blink" on every stall. Just continue and send
-			 * from the new position on the next call. */
+			/* Slow reader: the client fell behind and its read position
+			 * is no longer valid (some data was overwritten). Move it to
+			 * the actual data tail and keep serving the stream from there,
+			 * WITHOUT doing a full "restart" (no MPEG2TS headers re-send,
+			 * no precache re-init), so the player keeps playing without
+			 * blinking. */
+			sa_addr_port_to_str(&strh_cli->remonte_addr, straddr, sizeof(straddr), NULL);
+			syslog(LOG_INFO,
+			    "%s - %s: client fell behind, dropped = %zu, stream will be served from the tail.",
+			    str_hub->name, straddr, drop_size);
+			r_buf_rpos_init(r_buf, &strh_cli->rpos, 0);
 			goto send_done;
 		}
 	}
