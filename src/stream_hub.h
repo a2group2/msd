@@ -122,7 +122,7 @@ typedef struct str_hub_settings_s {
 #define STR_HUB_S_SKT_OPTS_RCVBUF	(4) /* Reduce kernel memory usage. */
 
 /* Default values. */
-#define STR_HUB_S_DEF_FLAGS		(STR_HUB_S_F_USE_SEND_POLLING | STR_HUB_S_F_DROP_SLOW_CLI)
+#define STR_HUB_S_DEF_FLAGS		(STR_HUB_S_F_USE_SEND_POLLING)
 #define STR_HUB_S_DEF_SKT_OPTS_MASK	(SO_F_SNDBUF |			\
 					SO_F_SNDLOWAT |			\
 					SO_F_SNDTIMEO |			\
