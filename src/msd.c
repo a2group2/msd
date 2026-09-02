@@ -79,6 +79,26 @@ typedef struct prog_service_s {
 	str_src_conn_params_t	src_conn_params; /* Stream hub source connection params. */
 } prog_service_t, *prog_service_p;
 
+/*
+ * Static channel definition (from channelList). Stored to be able to
+ * (re)create the stream hub on demand, same as auto generated hubs from
+ * streamProxy: when no clients are connected and the hub is not persistent
+ * it self-destroys, and the next /channel/NAME request recreates it.
+ */
+typedef struct msd_ch_src_def_s {
+	uint32_t			type;
+	str_src_settings_t		s;	/* Deep copy (m2ts alloc), src_conn_params points to conn. */
+	str_src_conn_params_t		conn;	/* Deep copy: owns req_buf / cust_http_hdrs. */
+} msd_ch_src_def_t, *msd_ch_src_def_p;
+
+typedef struct msd_ch_def_s {
+	uint8_t				name[STR_HUB_NAME_MAX_SIZE];
+	size_t				name_size;
+	str_hub_settings_t		hub;	/* Deep copy (cust_http_hdrs alloc). */
+	msd_ch_src_def_p		srcs;
+	size_t				src_count;
+} msd_ch_def_t, *msd_ch_def_p;
+
 typedef struct prog_settings {
 	tp_p		tp;
 	tp_udata_t	load_tmr;
@@ -100,6 +120,12 @@ typedef struct prog_settings {
 	prog_service_t	multicast;
 	prog_service_t	http;
 	prog_service_t	transparent;
+
+	/* Static channel definitions (from channelList) - to be able to
+	 * (re)create hubs on demand after they self-destroy. */
+	msd_ch_def_p	ch_defs;
+	size_t		ch_defs_count;
+	size_t		ch_defs_allocated;
 } prog_settings_t, *prog_settings_p;
 static prog_settings_t g_data;
 
@@ -125,6 +151,13 @@ int	msd_hub_cli_alloc_from_http(http_srv_cli_p cli, uint32_t cli_sub_type,
 int	msd_hub_attach_cli(str_hubs_bckt_p shbskt, const uint8_t *name, size_t name_size,
 	    http_srv_cli_p cli, uint32_t cli_sub_type, str_hub_settings_p hub_s,
 	    uint32_t src_type, str_src_settings_p src_s);
+int	msd_hub_attach_ch_def(str_hubs_bckt_p shbskt, http_srv_cli_p cli,
+	    uint32_t cli_sub_type, msd_ch_def_p ch_def);
+int	msd_ch_def_add(prog_settings_p ps, const uint8_t *hub_name, size_t hub_name_size,
+	    str_hub_settings_p hub_params);
+int	msd_ch_src_add(prog_settings_p ps, msd_ch_def_p ch_def, uint32_t src_type,
+	    str_src_settings_p src_params);
+msd_ch_def_p msd_ch_def_find(prog_settings_p ps, const uint8_t *name, size_t name_size);
 uint32_t msd_http_req_url_parse(int type, http_srv_req_p req,
 	    const uint8_t **str_addr, size_t *str_addr_size,
 	    sockaddr_storage_p ssaddr,
@@ -361,8 +394,12 @@ msd_channel_load(prog_settings_p ps, const uint8_t *cfg_file_buf, size_t cfg_fil
 	str_hub_xml_load_settings(data, data_size, hub_params);
 	/* Save copy. */
 	str_src_settings_copy(&src_s_local, &hub_params->str_src_settings);
-	/* Overwrite some stream hub flags. */
-	hub_params->flags |= (STR_HUB_S_F_ZERO_CLI_PERSISTENT | STR_HUB_S_F_ZERO_SRC_BITRATE_PERSISTENT);
+	/* Save channel definition to be able to (re)create the hub on demand
+	 * (like auto generated hubs from streamProxy) if it self-destroys
+	 * when no clients are connected and fZeroCliPersistent is not set. */
+	error = msd_ch_def_add(ps, hub_name, hub_name_size, hub_params);
+	if (0 != error)
+		syslog(LOG_ERR, "%s: msd_ch_def_add() fail.", hub_name);
 	/* Create and set. */
 	error = str_hub_send_msg(ps->shbskt, hub_name, hub_name_size,
 	    STR_HUB_CMD_CREATE, hub_params, sizeof(hub_params));
@@ -371,6 +408,7 @@ msd_channel_load(prog_settings_p ps, const uint8_t *cfg_file_buf, size_t cfg_fil
 		    "%s: str_hub_send_msg(STR_HUB_CMD_CREATE).", hub_name);
 		goto err_out;
 	}
+	hub_params = NULL; /* Ownership moved to str_hub_send_msg() above. */
 
 	/* Stream hub sources. */
 	cur_pos = NULL;
@@ -418,6 +456,16 @@ msd_channel_load(prog_settings_p ps, const uint8_t *cfg_file_buf, size_t cfg_fil
 		    0 != str_src_conn_http_gen_request(NULL, 0, NULL, 0, NULL, 0,
 		    &src_conn_params->http))
 			continue;
+		/* Save source definition for on demand hub (re)create. */
+		{
+			msd_ch_def_p ch_def = msd_ch_def_find(ps, hub_name, hub_name_size);
+			if (NULL != ch_def) {
+				error = msd_ch_src_add(ps, ch_def, tm32, src_params);
+				if (0 != error)
+					SYSLOG_ERR(LOG_ERR, error,
+					    "%s: msd_ch_src_add() fail.", hub_name);
+			}
+		}
 		error = str_hub_send_msg(ps->shbskt, hub_name, hub_name_size,
 		    STR_HUB_CMD_SRC_ADD, src_params, (size_t)tm32);
 		if (0 != error) {
@@ -785,6 +833,281 @@ msd_hub_cli_alloc_from_http(http_srv_cli_p cli, uint32_t cli_sub_type,
 	return (0);
 }
 
+/* Deep copy connection params, including http req_buf / cust headers.
+ * For tcp-http: host/url_path point inside req_buf (see
+ * str_src_conn_http_gen_request), so we copy req_buf data and fix
+ * the pointed offsets. */
+static int
+msd_ch_conn_copy(uint32_t type, str_src_conn_params_p dst,
+    str_src_conn_params_p src) {
+	size_t host_off, url_off;
+	io_buf_p req_buf, dst_req;
+
+	if (NULL == dst || NULL == src)
+		return (EINVAL);
+	memcpy(dst, src, sizeof(*dst));
+	switch (type) {
+	case STR_SRC_TYPE_TCP:
+		if (NULL != src->tcp.host && 0 != src->tcp.host_size) {
+			dst->tcp.host = malloc(src->tcp.host_size + 1);
+			if (NULL == dst->tcp.host)
+				return (ENOMEM);
+			memcpy((void*)dst->tcp.host, src->tcp.host,
+			    src->tcp.host_size);
+			((uint8_t*)dst->tcp.host)[src->tcp.host_size] = 0;
+		}
+		break;
+	case STR_SRC_TYPE_TCP_HTTP:
+		/* Custom headers. */
+		if (NULL != src->http.cust_http_hdrs &&
+		    0 != src->http.cust_http_hdrs_size) {
+			dst->http.cust_http_hdrs = malloc(
+			    src->http.cust_http_hdrs_size + 1);
+			if (NULL == dst->http.cust_http_hdrs)
+				return (ENOMEM);
+			memcpy((void*)dst->http.cust_http_hdrs,
+			    src->http.cust_http_hdrs,
+			    src->http.cust_http_hdrs_size);
+			((uint8_t*)dst->http.cust_http_hdrs)[src->http.cust_http_hdrs_size] = 0;
+		}
+		/* Request buffer (host/url_path point inside it). */
+		req_buf = src->http.req_buf;
+		if (NULL == req_buf)
+			break;
+		host_off = (size_t)(src->http.tcp.host - req_buf->data);
+		url_off = (size_t)(src->http.url_path - req_buf->data);
+		dst_req = io_buf_alloc(IO_BUF_FLAGS_STD, req_buf->size);
+		if (NULL == dst_req)
+			return (ENOMEM);
+		io_buf_copy_buf(dst_req, req_buf);
+		dst->http.req_buf = dst_req;
+		dst->http.tcp.host = (dst_req->data + host_off);
+		dst->http.url_path = (dst_req->data + url_off);
+		break;
+	default:
+		break;
+	}
+	return (0);
+}
+
+static void
+msd_ch_conn_free(uint32_t type, str_src_conn_params_p conn) {
+
+	if (NULL == conn)
+		return;
+	switch (type) {
+	case STR_SRC_TYPE_TCP:
+		free((void*)conn->tcp.host);
+		conn->tcp.host = NULL;
+		break;
+	case STR_SRC_TYPE_TCP_HTTP:
+		io_buf_free(conn->http.req_buf);
+		conn->http.req_buf = NULL;
+		free((void*)conn->http.cust_http_hdrs);
+		conn->http.cust_http_hdrs = NULL;
+		break;
+	default:
+		break;
+	}
+}
+
+msd_ch_def_p
+msd_ch_def_find(prog_settings_p ps, const uint8_t *name, size_t name_size) {
+	size_t i;
+
+	if (NULL == ps || NULL == name || 0 == name_size)
+		return (NULL);
+	for (i = 0; i < ps->ch_defs_count; i ++) {
+		if (name_size == ps->ch_defs[i].name_size &&
+		    0 == memcmp(ps->ch_defs[i].name, name, name_size))
+			return (&ps->ch_defs[i]);
+	}
+	return (NULL);
+}
+
+static void
+msd_ch_def_clean(msd_ch_def_p ch_def) {
+	size_t i;
+
+	if (NULL == ch_def)
+		return;
+	for (i = 0; i < ch_def->src_count; i ++) {
+		str_src_settings_free_data(&ch_def->srcs[i].s);
+		msd_ch_conn_free(ch_def->srcs[i].type,
+		    &ch_def->srcs[i].conn);
+	}
+	if (NULL != ch_def->srcs)
+		free(ch_def->srcs);
+	str_hub_settings_free_data(&ch_def->hub);
+	memset(ch_def, 0x00, sizeof(*ch_def));
+}
+
+int
+msd_ch_def_add(prog_settings_p ps, const uint8_t *hub_name, size_t hub_name_size,
+    str_hub_settings_p hub_params) {
+	int error;
+	msd_ch_def_p ch_def;
+	msd_ch_def_p tmp_defs;
+
+	if (NULL == ps || NULL == hub_name || 0 == hub_name_size ||
+	    NULL == hub_params || STR_HUB_NAME_MAX_SIZE <= hub_name_size)
+		return (EINVAL);
+	if (NULL != msd_ch_def_find(ps, hub_name, hub_name_size))
+		return (EEXIST);
+	if (ps->ch_defs_count >= ps->ch_defs_allocated) { /* Realloc array. */
+		ps->ch_defs_allocated += 8;
+		tmp_defs = reallocarray(ps->ch_defs, ps->ch_defs_allocated,
+		    sizeof(msd_ch_def_t));
+		if (NULL == tmp_defs)
+			return (ENOMEM);
+		ps->ch_defs = tmp_defs;
+	}
+	ch_def = &ps->ch_defs[ps->ch_defs_count];
+	memset(ch_def, 0x00, sizeof(*ch_def));
+	error = str_hub_settings_copy(&ch_def->hub, hub_params);
+	if (0 != error)
+		return (error);
+	memcpy(ch_def->name, hub_name, hub_name_size);
+	ch_def->name_size = hub_name_size;
+	ps->ch_defs_count ++;
+	return (0);
+}
+
+int
+msd_ch_src_add(prog_settings_p ps, msd_ch_def_p ch_def, uint32_t src_type,
+    str_src_settings_p src_params) {
+	int error;
+	msd_ch_src_def_p src_def, tmp_srcs;
+
+	if (NULL == ps || NULL == ch_def || NULL == src_params)
+		return (EINVAL);
+	if (STR_SRC_TYPE_UNKNOWN >= src_type || STR_SRC_TYPE___COUNT__ <= src_type)
+		return (EINVAL);
+	if (NULL == src_params->src_conn_params)
+		return (EINVAL);
+	tmp_srcs = reallocarray(ch_def->srcs, (ch_def->src_count + 1),
+	    sizeof(msd_ch_src_def_t));
+	if (NULL == tmp_srcs)
+		return (ENOMEM);
+	ch_def->srcs = tmp_srcs;
+	src_def = &ch_def->srcs[ch_def->src_count];
+	memset(src_def, 0x00, sizeof(*src_def));
+	src_def->type = src_type;
+	error = str_src_settings_copy(&src_def->s, src_params);
+	if (0 != error)
+		return (error);
+	error = msd_ch_conn_copy(src_type, &src_def->conn,
+	    src_params->src_conn_params);
+	if (0 != error) {
+		str_src_settings_free_data(&src_def->s);
+		msd_ch_conn_free(src_type, &src_def->conn);
+		return (error);
+	}
+	/* src_def->s was memcpy'ed from src_params, so its src_conn_params
+	 * pointer still references the original (short lived) allocation.
+	 * Repoint it to our own deep copy. */
+	src_def->s.src_conn_params = &src_def->conn;
+	ch_def->src_count ++;
+	return (0);
+}
+
+int
+msd_hub_attach_ch_def(str_hubs_bckt_p shbskt, http_srv_cli_p cli,
+    uint32_t cli_sub_type, msd_ch_def_p ch_def) {
+	int error;
+	size_t i;
+	str_hub_cli_p strh_cli;
+	str_hub_cli_attach_data_p attach_data;
+	str_hub_settings_p hub_s;
+	str_src_settings_p *src_s_list;
+	uint32_t *src_types;
+
+	if (NULL == shbskt || NULL == cli || NULL == ch_def)
+		return (EINVAL);
+	strh_cli = NULL;
+	attach_data = NULL;
+	hub_s = NULL;
+	src_s_list = NULL;
+	src_types = NULL;
+
+	/* Client data will be moved to stream hub. */
+	error = msd_hub_cli_alloc_from_http(cli, cli_sub_type, &strh_cli);
+	if (0 != error)
+		goto err_out;
+	attach_data = calloc(1, sizeof(*attach_data));
+	if (NULL == attach_data)
+		goto err_out;
+	hub_s = malloc(sizeof(*hub_s));
+	if (NULL == hub_s)
+		goto err_out;
+	error = str_hub_settings_copy(hub_s, &ch_def->hub);
+	if (0 != error)
+		goto err_out;
+	attach_data->strh_cli = strh_cli;
+	attach_data->hub_s = hub_s;
+	attach_data->free_flags = STR_HUB_CLI_ATTACH_DATA_F_HUB;
+	if (0 != ch_def->src_count) {
+		src_types = calloc(ch_def->src_count, sizeof(*src_types));
+		src_s_list = calloc(ch_def->src_count, sizeof(*src_s_list));
+		if (NULL == src_types || NULL == src_s_list)
+			goto err_out;
+		for (i = 0; i < ch_def->src_count; i ++) {
+			src_types[i] = ch_def->srcs[i].type;
+			src_s_list[i] = malloc(sizeof(**src_s_list));
+			if (NULL == src_s_list[i])
+				goto err_out;
+			memset(src_s_list[i], 0x00, sizeof(**src_s_list));
+			error = str_src_settings_copy(src_s_list[i],
+			    &ch_def->srcs[i].s);
+			if (0 != error)
+				goto err_out;
+			src_s_list[i]->src_conn_params = malloc(
+			    sizeof(*src_s_list[i]->src_conn_params));
+			if (NULL == src_s_list[i]->src_conn_params)
+				goto err_out;
+			error = msd_ch_conn_copy(src_types[i],
+			    src_s_list[i]->src_conn_params,
+			    &ch_def->srcs[i].conn);
+			if (0 != error)
+				goto err_out;
+		}
+		attach_data->free_flags |= STR_HUB_CLI_ATTACH_DATA_F_SRC_LIST;
+		attach_data->src_types = src_types;
+		attach_data->src_s_list = src_s_list;
+		attach_data->src_count = ch_def->src_count;
+	}
+	error = str_hub_send_msg(shbskt, ch_def->name, ch_def->name_size,
+	    STR_HUB_CMD_CREATE_CLI_ADD, attach_data, sizeof(attach_data));
+	if (0 != error)
+		goto err_out;
+	/* Ownership moved to stream hub. */
+	attach_data = NULL;
+	return (0);
+
+err_out:
+	/* CleanUp on errors. */
+	if (NULL != strh_cli) {
+		strh_cli->tptask = NULL;
+		str_hub_cli_destroy(strh_cli);
+	}
+	free(attach_data);
+	if (NULL != src_s_list) {
+		for (i = 0; i < ch_def->src_count; i ++) {
+			if (NULL == src_s_list[i])
+				continue;
+			str_src_settings_free_data(src_s_list[i]);
+			free(src_s_list[i]->src_conn_params);
+			free(src_s_list[i]);
+		}
+		free(src_s_list);
+	}
+	free(src_types);
+	if (NULL != hub_s) {
+		str_hub_settings_free_data(hub_s);
+		free(hub_s);
+	}
+	return (error);
+}
 int
 msd_hub_attach_cli(str_hubs_bckt_p shbskt, const uint8_t *name, size_t name_size,
     http_srv_cli_p cli, uint32_t cli_sub_type, str_hub_settings_p hub_s,
@@ -1174,11 +1497,24 @@ err_out_dyn_client:
 	if (9 < req->line.abs_path_size &&
 	    STR_HUB_NAME_MAX_SIZE > req->line.abs_path_size &&
 	    0 == memcmp(req->line.abs_path, "/channel/", 9)) {
-		if (0 != msd_hub_attach_cli(g_data.shbskt,
-		    req->line.abs_path, req->line.abs_path_size,
-		    cli, ((HTTP_REQ_METHOD_HEAD == req->line.method_code) ?
-		        STR_HUB_CLI_ST_TCP_HTTP_HEAD : STR_HUB_CLI_ST_NONE),
-		    NULL, STR_SRC_TYPE_UNKNOWN, NULL)) {
+		msd_ch_def_p ch_def = msd_ch_def_find(&g_data,
+		    req->line.abs_path, req->line.abs_path_size);
+		if (NULL != ch_def) {
+			/* Static channel: attach via CREATE_CLI_ADD so that the
+			 * hub is (re)created on demand if it self-destroyed
+			 * (fZeroCliPersistent=no / zeroCliTimeout). */
+			error = msd_hub_attach_ch_def(g_data.shbskt, cli,
+			    ((HTTP_REQ_METHOD_HEAD == req->line.method_code) ?
+			     STR_HUB_CLI_ST_TCP_HTTP_HEAD : STR_HUB_CLI_ST_NONE),
+			    ch_def);
+		} else {
+			error = msd_hub_attach_cli(g_data.shbskt,
+			    req->line.abs_path, req->line.abs_path_size,
+			    cli, ((HTTP_REQ_METHOD_HEAD == req->line.method_code) ?
+			        STR_HUB_CLI_ST_TCP_HTTP_HEAD : STR_HUB_CLI_ST_NONE),
+			    NULL, STR_SRC_TYPE_UNKNOWN, NULL);
+		}
+		if (0 != error) {
 			resp->status_code = 500;
 			return (HTTP_SRV_CB_CONTINUE);
 		}

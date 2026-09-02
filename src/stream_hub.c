@@ -1089,7 +1089,7 @@ str_hub_send_msg_cb(tpt_p tpt, void *udata) {
 			    msg_data->name, msg_data->name_size, &str_hub);
 			SYSLOG_ERR(LOG_ERR, error, "%s: str_hub_create() fail.",
 			    msg_data->name);
-			if (0 == error) {
+			if (0 == error && NULL != attach_data->hub_s) {
 				error = str_hub_settings_set(str_hub,
 				    attach_data->hub_s);
 				SYSLOG_ERR(LOG_ERR, error,
@@ -1097,12 +1097,27 @@ str_hub_send_msg_cb(tpt_p tpt, void *udata) {
 				    msg_data->name);
 			}
 			if (0 == error) {
-				error = str_hub_src_add(str_hub,
-				    attach_data->src_type,
-				    attach_data->src_s);
-				SYSLOG_ERR(LOG_ERR, error,
-				    "%s: str_hub_src_add() fail.",
-				    msg_data->name);
+				if (NULL != attach_data->src_s_list &&
+				    0 != attach_data->src_count) {
+					size_t src_i;
+					for (src_i = 0;
+					    src_i < attach_data->src_count;
+					    src_i ++) {
+						error = str_hub_src_add(str_hub,
+						    attach_data->src_types[src_i],
+						    attach_data->src_s_list[src_i]);
+						SYSLOG_ERR(LOG_ERR, error,
+						    "%s: str_hub_src_add() #%zu fail.",
+						    msg_data->name, src_i);
+					}
+				} else if (NULL != attach_data->src_s) {
+					error = str_hub_src_add(str_hub,
+					    attach_data->src_type,
+					    attach_data->src_s);
+					SYSLOG_ERR(LOG_ERR, error,
+					    "%s: str_hub_src_add() fail.",
+					    msg_data->name);
+				}
 			}
 		}
 		if (0 == error &&
@@ -1120,9 +1135,23 @@ str_hub_send_msg_cb(tpt_p tpt, void *udata) {
 			str_hub_settings_free_data(attach_data->hub_s);
 			free(attach_data->hub_s);
 		}
-		if (0 != (STR_HUB_CLI_ATTACH_DATA_F_SRC & attach_data->free_flags)) {
+		if (0 != (STR_HUB_CLI_ATTACH_DATA_F_SRC & attach_data->free_flags) && NULL != attach_data->src_s) {
 			str_src_settings_free_data(attach_data->src_s);
+			free(attach_data->src_s->src_conn_params);
 			free(attach_data->src_s);
+		}
+		if (0 != (STR_HUB_CLI_ATTACH_DATA_F_SRC_LIST & attach_data->free_flags) &&
+		    NULL != attach_data->src_s_list) {
+			size_t src_i;
+			for (src_i = 0; src_i < attach_data->src_count; src_i ++) {
+				if (NULL == attach_data->src_s_list[src_i])
+					continue;
+				str_src_settings_free_data(attach_data->src_s_list[src_i]);
+				free(attach_data->src_s_list[src_i]->src_conn_params);
+				free(attach_data->src_s_list[src_i]);
+			}
+			free(attach_data->src_s_list);
+			free(attach_data->src_types);
 		}
 		free(msg_data->arg1);
 		break;

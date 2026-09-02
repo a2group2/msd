@@ -262,10 +262,15 @@ typedef struct str_hub_cli_attach_data_s {
 	str_hub_settings_p	hub_s;
 	uint32_t		src_type;
 	str_src_settings_p	src_s;
+	/* Multiple predefined sources (static channels). */
+	uint32_t			*src_types;
+	str_src_settings_p	*src_s_list;
+	size_t			src_count;
 } str_hub_cli_attach_data_t, *str_hub_cli_attach_data_p;
 #define STR_HUB_CLI_ATTACH_DATA_F_HUB	(((uint32_t)1) << 0)
 #define STR_HUB_CLI_ATTACH_DATA_F_SRC	(((uint32_t)1) << 1)
-#define STR_HUB_CLI_ATTACH_DATA_F_ALL	(STR_HUB_CLI_ATTACH_DATA_F_HUB | STR_HUB_CLI_ATTACH_DATA_F_SRC)
+#define STR_HUB_CLI_ATTACH_DATA_F_SRC_LIST (((uint32_t)1) << 2)
+#define STR_HUB_CLI_ATTACH_DATA_F_ALL	(STR_HUB_CLI_ATTACH_DATA_F_HUB | STR_HUB_CLI_ATTACH_DATA_F_SRC | STR_HUB_CLI_ATTACH_DATA_F_SRC_LIST)
 
 
 #endif /* __STREAM_HUB_H__ */
