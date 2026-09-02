@@ -44,12 +44,14 @@
 #include <time.h>
 #include <errno.h>
 #include <syslog.h>
+#include <inttypes.h>
 
 #include "utils/macro.h"
 #include "threadpool/threadpool.h"
 #include "threadpool/threadpool_task.h"
 #include "net/socket.h"
 #include "net/socket_address.h"
+#include "net/host_address.h"
 #include "net/utils.h"
 #include "utils/buf_str.h"
 #include "utils/ring_buffer.h"
@@ -69,6 +71,9 @@
 #define STR_SRC_UDP_PKT_SIZE_JUMBO16	16384	/* Get ready to receive jumbo frames. */
 #define STR_SRC_UDP_PKT_SIZE_MAX	65612	/* 349 * 188 */
 
+#define STR_SRC_HTTP_REDIRECT_HOST_MAX	256	/* Max size of host[:port] from Location hdr. */
+#define STR_SRC_HTTP_REDIRECT_PATH_MAX	2048	/* Max size of url path from Location hdr. */
+
 
 void	str_src_init(str_src_p src);
 int	str_src_connect(str_src_p src, int retry);
@@ -86,7 +91,10 @@ static int str_src_recv_http_cb(tp_task_p tptask, int error, uint32_t eof,
 static int str_src_recv_tcp_cb(tp_task_p tptask, int error, uint32_t eof,
 	    size_t data2transfer_size, void *arg);
 static int str_src_recv_mc_cb(tp_task_p tptask, int error, uint32_t eof,
-	    size_t data2transfer_size, void *arg);
+    size_t data2transfer_size, void *arg);
+static int str_src_http_redirect_is_code(uint32_t status_code);
+static int str_src_http_redirect_follow(str_src_p src,
+    const uint8_t *location, size_t location_size);
 
 void	str_src_r_buf_f_name_gen(str_src_p src);
 int	str_src_r_buf_alloc(str_src_p src, const int keep_tail_data);
@@ -507,7 +515,9 @@ str_src_conn_http_gen_request(const uint8_t *host, size_t host_size,
 		host = conn_http->tcp.host;
 		host_size = conn_http->tcp.host_size;
 	}
-	if (NULL == url_path || 0 == url_path_size) {
+	if (NULL == url_path) { /* NOTE: url_path_size == 0 is a valid value
+		 * (request for the host root "/"), so it must not trigger
+		 * fallback to the previously stored url_path. */
 		url_path = conn_http->url_path;
 		url_path_size = conn_http->url_path_size;
 	}
@@ -695,6 +705,7 @@ str_src_start(str_src_p src) {
 	/* Use short name. */
 	s = &src->s;
 	str_src_init(src);
+	src->http_redirect_count = 0; /* Fresh (re)start: reset redirect chain counter. */
 
 	switch (src->type) {
 	case STR_SRC_TYPE_UDP:
@@ -1023,6 +1034,164 @@ err_out:
 	return (TP_TASK_CB_NONE);
 }
 
+/* Is this a HTTP status code that we should follow via "Location" hdr? */
+static int
+str_src_http_redirect_is_code(uint32_t status_code) {
+
+	switch (status_code) {
+	case 301: /* Moved Permanently */
+	case 302: /* Found */
+	case 303: /* See Other */
+	case 307: /* Temporary Redirect */
+	case 308: /* Permanent Redirect */
+		return (1);
+	}
+	return (0);
+}
+
+/*
+ * Parse "Location" header value and reconfigure src to point to the new
+ * destination: regenerate the HTTP request and resolve/set new addr(s).
+ * Does NOT perform reconnect: caller is responsible for that.
+ * Supported Location forms:
+ *   http://host[:port]/path
+ *   /absolute/path (same host is kept)
+ * "https://" targets are rejected: this client has no TLS support.
+ * Ret value: 0 - OK, ready to (re)connect; non zero - error, do not connect.
+ */
+static int
+str_src_http_redirect_follow(str_src_p src, const uint8_t *location,
+    size_t location_size) {
+	str_src_conn_http_p conn_http;
+	str_src_conn_tcp_p conn_tcp;
+	host_addr_p haddr;
+	const uint8_t *host, *path, *ptm, *loc_end;
+	size_t host_size, path_size, i;
+	uint8_t host_buf[STR_SRC_HTTP_REDIRECT_HOST_MAX];
+	uint8_t path_buf[STR_SRC_HTTP_REDIRECT_PATH_MAX];
+	sockaddr_storage_t addr;
+	int error;
+
+	if (NULL == src || NULL == location || 0 == location_size)
+		return (EINVAL);
+	if (STR_SRC_HTTP_MAX_REDIRECTS <= src->http_redirect_count) {
+		syslog(LOG_ERR, "HTTP redirect: limit of %i redirects "
+		    "exceeded, giving up.", STR_SRC_HTTP_MAX_REDIRECTS);
+		return (EMLINK);
+	}
+
+	conn_http = &src->s.src_conn_params->http;
+	conn_tcp = &conn_http->tcp;
+
+	skip_spwsp2(location, location_size, &location, &location_size);
+	if (0 == location_size || NULL == location)
+		return (EBADMSG);
+	loc_end = (location + location_size);
+
+	if (8 <= location_size &&
+	    0 == mem_cmpin_cstr("https://", location, 8)) {
+		syslog(LOG_ERR, "HTTP redirect to https:// is not "
+		    "supported (no TLS support): %.*s",
+		    (int)location_size, location);
+		return (EPROTONOSUPPORT);
+	}
+	if (7 <= location_size &&
+	    0 == mem_cmpin_cstr("http://", location, 7)) {
+		host = (location + 7);
+		ptm = mem_chr_ptr(host, location, location_size, '/');
+		if (NULL == ptm) { /* No path in redirect target: use "/". */
+			host_size = (size_t)(loc_end - host);
+			path = NULL;
+			path_size = 0;
+		} else {
+			host_size = (size_t)(ptm - host);
+			path = ptm;
+			path_size = (size_t)(loc_end - ptm);
+		}
+	} else if ('/' == location[0]) { /* Absolute path: same host. */
+		host = conn_tcp->host;
+		host_size = conn_tcp->host_size;
+		path = location;
+		path_size = location_size;
+	} else {
+		syslog(LOG_ERR, "HTTP redirect: unsupported/relative "
+		    "Location: %.*s", (int)location_size, location);
+		return (EINVAL);
+	}
+
+	if (NULL == host || 0 == host_size ||
+	    STR_SRC_HTTP_REDIRECT_HOST_MAX <= host_size ||
+	    STR_SRC_HTTP_REDIRECT_PATH_MAX <= path_size)
+		return (EINVAL);
+
+	memcpy(host_buf, host, host_size);
+	host_buf[host_size] = 0;
+	/* Skip leading '/': str_src_conn_http_gen_request() adds it back
+	 * via its "GET /" prefix. */
+	if (0 != path_size && '/' == path[0]) {
+		path ++;
+		path_size --;
+	}
+	if (0 != path_size) {
+		memcpy(path_buf, path, path_size);
+	}
+	path_buf[path_size] = 0;
+
+	/* Resolve new destination address(es).
+	 * Try literal IP[:port] first (no blocking), then fall back to a
+	 * (blocking) DNS resolve: str_src has no async resolver wired in,
+	 * and redirects are rare one-off events, so a short block here is
+	 * an acceptable trade-off. */
+	memset(&addr, 0x00, sizeof(addr));
+	conn_tcp->addr_count = 0;
+	conn_tcp->addr_index = 0;
+	if (0 == sa_addr_port_from_str(&addr, (const char*)host_buf, host_size)) {
+		if (0 == sa_port_get(&addr)) {
+			sa_port_set(&addr, HTTP_PORT);
+		}
+		memcpy(&conn_tcp->addr[0], &addr, sizeof(addr));
+		conn_tcp->addr_count = 1;
+	} else { /* Not a literal address: try DNS resolve. */
+		haddr = host_addr_alloc(host_buf, host_size, HTTP_PORT);
+		if (NULL == haddr)
+			return (ENOMEM);
+		if (0 != host_addr_resolv(haddr) || 0 == haddr->count) {
+			syslog(LOG_ERR,
+			    "HTTP redirect: cant resolve host: %s", host_buf);
+			host_addr_free(haddr);
+			return (EADDRNOTAVAIL);
+		}
+		for (i = 0; i < haddr->count && i < STR_SRC_CONN_TCP_MAX_ADDRS; i ++) {
+			memcpy(&conn_tcp->addr[i], &haddr->addrs[i],
+			    sizeof(sockaddr_storage_t));
+		}
+		conn_tcp->addr_count = i;
+		host_addr_free(haddr);
+	}
+
+	/* Free previous request buffer: a new one is allocated by
+	 * str_src_conn_http_gen_request() below. */
+	io_buf_free(conn_http->req_buf);
+	conn_http->req_buf = NULL;
+
+	error = str_src_conn_http_gen_request(host_buf, host_size,
+	    path_buf, path_size, NULL, 0, conn_http);
+	if (0 != error) {
+		SYSLOG_ERR(LOG_ERR, error,
+		    "str_src_conn_http_gen_request() on redirect.");
+		return (error);
+	}
+
+	src->http_redirect_count ++;
+	syslog(LOG_INFO,
+	    "HTTP redirect (%zu/%i): following to: http://%s/%s",
+	    src->http_redirect_count, STR_SRC_HTTP_MAX_REDIRECTS,
+	    host_buf, path_buf);
+
+	return (0);
+}
+
+
 static int
 str_src_recv_http_cb(tp_task_p tptask, int error, uint32_t eof,
     size_t data2transfer_size, void *arg) {
@@ -1030,8 +1199,8 @@ str_src_recv_http_cb(tp_task_p tptask, int error, uint32_t eof,
 	uintptr_t ident;
 	ssize_t ios;
 	uint8_t *buf, *ptm;
-	const uint8_t *te;
-	size_t transfered_size = 0, buf_size, te_size;
+	const uint8_t *te, *location;
+	size_t transfered_size = 0, buf_size, te_size, location_size;
 	http_resp_line_data_t resp_data;
 
 	SYSLOGD_EX(LOG_DEBUG, "...");
@@ -1087,6 +1256,29 @@ err_out:
 		if (0 != error)
 			break;
 		src->http_resp_code = resp_data.status_code;
+		/* HTTP redirect (301, 302, 303, 307, 308) support. */
+		if (0 != str_src_http_redirect_is_code(resp_data.status_code)) {
+			if (0 != http_hdr_val_get(buf, (size_t)(ptm - buf),
+			    (const uint8_t*)"location", 8,
+			    &location, &location_size)) {
+				syslog(LOG_ERR,
+				    "HTTP redirect: status %"PRIu32" without"
+				    " a \"Location\" header.",
+				    resp_data.status_code);
+				error = EBADMSG;
+				goto err_out;
+			}
+			error = str_src_http_redirect_follow(src, location,
+			    location_size);
+			if (0 != error)
+				goto err_out; /* Fatal: too many redirects, bad/unsupported target, etc. */
+			/* Drop current connection and (re)connect to the
+			 * new destination that str_src_http_redirect_follow()
+			 * has already stored in conn_tcp->addr[]. */
+			str_src_stop(src);
+			str_src_connect(src, 0);
+			return (TP_TASK_CB_NONE); /* Receiver destroyed. */
+		}
 		/* Transfer encoding support. */
 		src->http_te = HTTP_REQ_TE_NONE;
 		if (0 == http_hdr_val_get(buf, (size_t)(ptm - buf),

@@ -89,6 +89,10 @@ typedef struct str_src_conn_http_s {
 #define STR_SRC_CONN_DEF_RETRY_INTERVAL	(5)	/* s */
 #define STR_SRC_CONN_DEF_TRY_COUNT	(~((uint64_t)0))
 
+/* Max number of HTTP redirects (301, 302, 303, 307, 308) to follow
+ * before giving up, to avoid infinite redirect loops. */
+#define STR_SRC_HTTP_MAX_REDIRECTS	5
+
 
 typedef union str_src_conn_params_s {
 	str_src_conn_udp_t	udp;
@@ -166,6 +170,7 @@ typedef struct str_src_s {
 	uint32_t	http_resp_code;	/* Last http error code. */
 	int		http_te;	/* HTTP transfer encoding. */
 	size_t		http_te_chunk;	/* transfer encoding chunk size. */
+	size_t		http_redirect_count; /* Count of http redirects (3xx) followed for current request. */
 	uint32_t	rtp_sn;		/* Continuity/Sequence number. */
 	uint64_t	rtp_sn_errors;	/* Count Continuity/Sequence number errors. */
 
