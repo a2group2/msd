@@ -87,6 +87,7 @@ int	str_src_connect(str_src_p src, int retry);
  * other: Try connect to other addr: conn_try = 0, addr_index ++;
  */
 int	str_src_connect_retry(str_src_p src);
+static void str_src_conn_err_reconnect(str_src_p src, int error);
 static int str_src_connected(tp_task_p tptask, int error, void *arg);
 static int str_src_send_http_req_done_cb(tp_task_p tptask, int error,
 	    io_buf_p buf, uint32_t eof, size_t transfered_size, void *arg);
@@ -186,9 +187,16 @@ str_src_timer_proc(str_src_p src, struct timespec *ts_now, struct timespec *ts_p
 		    (tmt == ts_now->tv_sec && src->last_recv_time.tv_nsec < ts_now->tv_nsec)) {
 			if (STR_SRC_TYPE_TCP == src->type ||
 			    STR_SRC_TYPE_TCP_HTTP == src->type) {
-				if (STR_SRC_STATE_DATA_WAITING == src->state) {
-					/* Timeout first data receive, reconnect. */
-					str_src_connect(src, 1);
+				/* No data received for rcv_timeout from a TCP/TCP_HTTP
+				 * source (connection may be dead/hung): schedule an
+				 * automatic reconnect. */
+				if (STR_SRC_STATE_RUNNING == src->state ||
+				    STR_SRC_STATE_DATA_WAITING == src->state ||
+				    STR_SRC_STATE_DATA_REQ == src->state) {
+					error = str_src_connect_retry(src);
+					if (0 != error)
+						SYSLOG_ERR(LOG_NOTICE, error,
+						    "str_src_connect_retry().");
 					return (0);
 				}
 			}
@@ -994,12 +1002,34 @@ str_src_connect_retry(str_src_p src) {
 	if (STR_SRC_TYPE_TCP != src->type &&
 	    STR_SRC_TYPE_TCP_HTTP != src->type)
 		return (EINVAL); /* Only for tcp connections. */
-	if (STR_SRC_STATE_CONNECTING != src->state)
-		return (EINVAL);
+	/* Allowed from any state: stop current connection (if any) and
+	 * schedule a reconnect. The timer service will (re)connect after
+	 * retry_interval. */
 	str_src_stop(src);
 	clock_gettime(CLOCK_MONOTONIC_FAST, &src->last_recv_time);
 	
 	return (str_src_state_update(src, STR_SRC_STATE_RECONNECTING, 0, 0));
+}
+
+/* Common fatal-error handler for TCP/TCP_HTTP sources:
+ * mark the source with error and schedule automatic reconnect. */
+static void
+str_src_conn_err_reconnect(str_src_p src, int error) {
+	int rerr;
+
+	if (NULL == src)
+		return;
+	src->last_err = error;
+	/* Notify hub about the error. */
+	str_src_state_update(src, STR_SRC_STATE_CURRENT,
+	    SRC_STATUS_SET_BIT, STR_SRC_STATUS_ERROR);
+	/* Schedule automatic reconnect (RECONNECTING -> connect after retry_interval). */
+	rerr = str_src_connect_retry(src);
+	if (0 != rerr) { /* Fallback: hard stop. */
+		str_src_stop(src);
+		str_src_state_update(src, STR_SRC_STATE_STOP,
+		    SRC_STATUS_SET_BIT, STR_SRC_STATUS_ERROR);
+	}
 }
 
 
@@ -1307,12 +1337,8 @@ err_out:
 		if (0 != eof) {
 			SYSLOGD_EX(LOG_DEBUG, "eof...");
 		}
-		src->last_err = error;
-		//str_src_restart(src);
-		str_src_stop(src);
-		src->last_err = error;
-		str_src_state_update(src, STR_SRC_STATE_STOP,
-		    SRC_STATUS_SET_BIT, STR_SRC_STATUS_ERROR);
+		/* Stop current connection and schedule automatic reconnect. */
+		str_src_conn_err_reconnect(src, error);
 		return (TP_TASK_CB_NONE); /* Receiver destroyed. */
 	}
 	if (NULL == src->r_buf) { /* Delay ring buf allocation. */
@@ -1483,16 +1509,12 @@ str_src_recv_tcp_cb(tp_task_p tptask, int error, uint32_t eof,
 
 	if (0 != error || 0 != eof) {
 err_out:
-		src->last_err = error;
 		SYSLOG_ERR(LOG_DEBUG, error, "On receive.");
 		if (0 != eof) {
 			SYSLOGD_EX(LOG_DEBUG, "eof...");
 		}
-		str_src_restart(src);
-		//str_src_stop(src);
-		src->last_err = error;
-		str_src_state_update(src, STR_SRC_STATE_STOP,
-		    SRC_STATUS_SET_BIT, STR_SRC_STATUS_ERROR);
+		/* Stop current connection and schedule automatic reconnect. */
+		str_src_conn_err_reconnect(src, error);
 		return (TP_TASK_CB_NONE); /* Receiver destroyed. */
 	}
 	if (NULL == src->r_buf) { /* Delay ring buf allocation. */
