@@ -88,6 +88,7 @@ int	str_src_connect(str_src_p src, int retry);
  */
 int	str_src_connect_retry(str_src_p src);
 static void str_src_conn_err_reconnect(str_src_p src, int error);
+static void str_src_conn_err_fatal(str_src_p src, int error);
 static int str_src_connected(tp_task_p tptask, int error, void *arg);
 static int str_src_send_http_req_done_cb(tp_task_p tptask, int error,
 	    io_buf_p buf, uint32_t eof, size_t transfered_size, void *arg);
@@ -706,6 +707,8 @@ str_src_init(str_src_p src) {
 	src->status = STR_SRC_STATUS_OK;
 	src->last_err = 0;
 	src->http_resp_code = 0;
+	src->http_te = HTTP_REQ_TE_NONE;
+	src->http_te_chunk = 0;
 	//src->rtp_sn = 0;
 	//src->rtp_sn_errors = 0;
 }
@@ -936,9 +939,11 @@ str_src_connect(str_src_p src, int retry) {
 	case 1:  /* Retry connect to selected addr. */
 		sa_addr_port_to_str(&conn_tcp->addr[conn_tcp->addr_index], straddr,
 		    sizeof(straddr), NULL);
+		conn_tcp->conn_try ++;
+		if (0 != src->http_retry_forever) /* HTTP 5xx: keep retrying this addr forever. */
+			conn_tcp->conn_try = 0;
 		syslog(LOG_INFO, "Retry %"PRIu64"/%"PRIu64" connect to %s...",
 		    conn_tcp->conn_try, conn_tcp->conn_try_count, straddr);
-		conn_tcp->conn_try ++;
 		if (conn_tcp->conn_try < conn_tcp->conn_try_count)
 			break;
 		/* Tryes connect to addr exeed. */
@@ -1030,6 +1035,19 @@ str_src_conn_err_reconnect(str_src_p src, int error) {
 		str_src_state_update(src, STR_SRC_STATE_STOP,
 		    SRC_STATUS_SET_BIT, STR_SRC_STATUS_ERROR);
 	}
+}
+
+/* Common fatal-error handler for TCP/TCP_HTTP sources:
+ * permanent failure (e.g. HTTP 4xx) - stop the source, no reconnect. */
+static void
+str_src_conn_err_fatal(str_src_p src, int error) {
+
+	if (NULL == src)
+		return;
+	src->last_err = error;
+	str_src_stop(src);
+	str_src_state_update(src, STR_SRC_STATE_STOP,
+	    SRC_STATUS_SET_BIT, STR_SRC_STATUS_ERROR);
 }
 
 
@@ -1412,6 +1430,32 @@ err_out:
 			str_src_connect(src, 0);
 			return (TP_TASK_CB_NONE); /* Receiver destroyed. */
 		}
+		/* HTTP server error (5xx): source temporarily unavailable
+		 * (e.g. Acestream engine still starting). Treat as retryable:
+		 * keep reconnecting forever (reconnectInterval apart), the flag
+		 * makes str_src_connect() ignore reconnectCount exhaustion, so
+		 * the source comes back as soon as the server returns 200. */
+		if (500 <= resp_data.status_code && 600 > resp_data.status_code) {
+			src->http_resp_code = resp_data.status_code;
+			src->http_retry_forever = 1;
+			syslog(LOG_WARNING,
+			    "HTTP source resp: status %"PRIu32" - source not ready, "
+			    "will keep retrying.", resp_data.status_code);
+			str_src_conn_err_reconnect(src, EBUSY);
+			return (TP_TASK_CB_NONE); /* Receiver destroyed. */
+		}
+		/* HTTP client error (4xx): fatal - no point in retrying
+		 * (e.g. 404 Not Found, 403 Forbidden). Stop the source. */
+		if (400 <= resp_data.status_code && 500 > resp_data.status_code) {
+			src->http_resp_code = resp_data.status_code;
+			src->http_retry_forever = 0;
+			syslog(LOG_ERR,
+			    "HTTP source resp: status %"PRIu32" - fatal, stop source.",
+			    resp_data.status_code);
+			str_src_conn_err_fatal(src, EACCES);
+			return (TP_TASK_CB_NONE); /* Receiver destroyed. */
+		}
+		src->http_retry_forever = 0;
 		/* Transfer encoding support. */
 		src->http_te = HTTP_REQ_TE_NONE;
 		if (0 == http_hdr_val_get(buf, (size_t)(ptm - buf),

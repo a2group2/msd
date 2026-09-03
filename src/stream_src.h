@@ -196,6 +196,7 @@ typedef struct str_src_s {
 	int		last_err;	/* Last errno. */
 	uint32_t	http_resp_code;	/* Last http error code. */
 	int		http_te;	/* HTTP transfer encoding. */
+	int		http_retry_forever; /* HTTP 5xx seen: keep retrying regardless of reconnectCount. */
 	size_t		http_te_chunk;	/* transfer encoding chunk size. */
 	size_t		http_redirect_count; /* Count of http redirects (3xx) followed for current request. */
 	uint32_t	rtp_sn;		/* Continuity/Sequence number. */
