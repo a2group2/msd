@@ -1089,20 +1089,18 @@ int
 msd_hub_attach_ch_def(str_hubs_bckt_p shbskt, http_srv_cli_p cli,
     uint32_t cli_sub_type, msd_ch_def_p ch_def) {
 	int error;
-	size_t i;
 	str_hub_cli_p strh_cli;
 	str_hub_cli_attach_data_p attach_data;
 	str_hub_settings_p hub_s;
-	str_src_settings_p *src_s_list;
-	uint32_t *src_types;
+	str_src_settings_p src_s;
 
-	if (NULL == shbskt || NULL == cli || NULL == ch_def)
+	if (NULL == shbskt || NULL == cli || NULL == ch_def ||
+	    0 == ch_def->src_count || NULL == ch_def->srcs)
 		return (EINVAL);
 	strh_cli = NULL;
 	attach_data = NULL;
 	hub_s = NULL;
-	src_s_list = NULL;
-	src_types = NULL;
+	src_s = NULL;
 
 	/* Client data will be moved to stream hub. */
 	error = msd_hub_cli_alloc_from_http(cli, cli_sub_type, &strh_cli);
@@ -1117,39 +1115,29 @@ msd_hub_attach_ch_def(str_hubs_bckt_p shbskt, http_srv_cli_p cli,
 	error = str_hub_settings_copy(hub_s, &ch_def->hub);
 	if (0 != error)
 		goto err_out;
+	/* Single source: use the first one from the channel definition. */
+	src_s = malloc(sizeof(*src_s));
+	if (NULL == src_s)
+		goto err_out;
+	memset(src_s, 0x00, sizeof(*src_s));
+	error = str_src_settings_copy(src_s, &ch_def->srcs[0].s);
+	if (0 != error)
+		goto err_out;
+	src_s->src_conn_params = malloc(sizeof(*src_s->src_conn_params));
+	if (NULL == src_s->src_conn_params)
+		goto err_out;
+	error = msd_ch_conn_copy(ch_def->srcs[0].type,
+	    src_s->src_conn_params, &ch_def->srcs[0].conn);
+	if (0 != error)
+		goto err_out;
+
 	attach_data->strh_cli = strh_cli;
 	attach_data->hub_s = hub_s;
-	attach_data->free_flags = STR_HUB_CLI_ATTACH_DATA_F_HUB;
-	if (0 != ch_def->src_count) {
-		src_types = calloc(ch_def->src_count, sizeof(*src_types));
-		src_s_list = calloc(ch_def->src_count, sizeof(*src_s_list));
-		if (NULL == src_types || NULL == src_s_list)
-			goto err_out;
-		for (i = 0; i < ch_def->src_count; i ++) {
-			src_types[i] = ch_def->srcs[i].type;
-			src_s_list[i] = malloc(sizeof(**src_s_list));
-			if (NULL == src_s_list[i])
-				goto err_out;
-			memset(src_s_list[i], 0x00, sizeof(**src_s_list));
-			error = str_src_settings_copy(src_s_list[i],
-			    &ch_def->srcs[i].s);
-			if (0 != error)
-				goto err_out;
-			src_s_list[i]->src_conn_params = malloc(
-			    sizeof(*src_s_list[i]->src_conn_params));
-			if (NULL == src_s_list[i]->src_conn_params)
-				goto err_out;
-			error = msd_ch_conn_copy(src_types[i],
-			    src_s_list[i]->src_conn_params,
-			    &ch_def->srcs[i].conn);
-			if (0 != error)
-				goto err_out;
-		}
-		attach_data->free_flags |= STR_HUB_CLI_ATTACH_DATA_F_SRC_LIST;
-		attach_data->src_types = src_types;
-		attach_data->src_s_list = src_s_list;
-		attach_data->src_count = ch_def->src_count;
-	}
+	attach_data->src_type = ch_def->srcs[0].type;
+	attach_data->src_s = src_s;
+	attach_data->free_flags = (STR_HUB_CLI_ATTACH_DATA_F_HUB |
+	    STR_HUB_CLI_ATTACH_DATA_F_SRC);
+
 	error = str_hub_send_msg(shbskt, ch_def->name, ch_def->name_size,
 	    STR_HUB_CMD_CREATE_CLI_ADD, attach_data, sizeof(attach_data));
 	if (0 != error)
@@ -1165,17 +1153,12 @@ err_out:
 		str_hub_cli_destroy(strh_cli);
 	}
 	free(attach_data);
-	if (NULL != src_s_list) {
-		for (i = 0; i < ch_def->src_count; i ++) {
-			if (NULL == src_s_list[i])
-				continue;
-			str_src_settings_free_data(src_s_list[i]);
-			free(src_s_list[i]->src_conn_params);
-			free(src_s_list[i]);
-		}
-		free(src_s_list);
+	if (NULL != src_s) {
+		if (NULL != src_s->src_conn_params)
+			free(src_s->src_conn_params);
+		str_src_settings_free_data(src_s);
+		free(src_s);
 	}
-	free(src_types);
 	if (NULL != hub_s) {
 		str_hub_settings_free_data(hub_s);
 		free(hub_s);
