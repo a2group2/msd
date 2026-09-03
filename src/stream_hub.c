@@ -1052,11 +1052,13 @@ str_hub_send_msg_cb(tpt_p tpt, void *udata) {
 			syslog(LOG_ERR,
 			    "%s: str_hub_src_add() - HUB NOT FOUND!!!",
 			    msg_data->name);
+			free(((str_src_settings_p)msg_data->arg1)->src_conn_params);
 			free(msg_data->arg1);
 			break;
 		}
 		error = str_hub_src_add(str_hub, (uint32_t)msg_data->arg2,
 		    (str_src_settings_p)msg_data->arg1);
+		free(((str_src_settings_p)msg_data->arg1)->src_conn_params);
 		free(msg_data->arg1);
 		SYSLOG_ERR(LOG_ERR, error, "%s: str_hub_src_add() fail.",
 		    msg_data->name);

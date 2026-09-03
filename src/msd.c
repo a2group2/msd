@@ -1089,6 +1089,7 @@ int
 msd_hub_attach_ch_def(str_hubs_bckt_p shbskt, http_srv_cli_p cli,
     uint32_t cli_sub_type, msd_ch_def_p ch_def) {
 	int error;
+	size_t i;
 	str_hub_cli_p strh_cli;
 	str_hub_cli_attach_data_p attach_data;
 	str_hub_settings_p hub_s;
@@ -1144,6 +1145,50 @@ msd_hub_attach_ch_def(str_hubs_bckt_p shbskt, http_srv_cli_p cli,
 		goto err_out;
 	/* Ownership moved to stream hub. */
 	attach_data = NULL;
+	/* Add the remaining sources of the channel (index 1..N-1) with
+	 * separate STR_HUB_CMD_SRC_ADD messages (safe: each carries its own
+	 * deep copy; the multi-source CREATE_CLI_ADD path is removed because
+	 * it crashed on channel switch). The first source is already added
+	 * via CREATE_CLI_ADD above. */
+	for (i = 1; i < ch_def->src_count; i ++) {
+		str_src_settings_p extra_src;
+
+		extra_src = malloc(sizeof(*extra_src));
+		if (NULL == extra_src) {
+			error = ENOMEM;
+			goto err_out;
+		}
+		memset(extra_src, 0x00, sizeof(*extra_src));
+		error = str_src_settings_copy(extra_src, &ch_def->srcs[i].s);
+		if (0 != error) {
+			free(extra_src);
+			goto err_out;
+		}
+		extra_src->src_conn_params = malloc(sizeof(*extra_src->src_conn_params));
+		if (NULL == extra_src->src_conn_params) {
+			str_src_settings_free_data(extra_src);
+			free(extra_src);
+			error = ENOMEM;
+			goto err_out;
+		}
+		error = msd_ch_conn_copy(ch_def->srcs[i].type,
+		    extra_src->src_conn_params, &ch_def->srcs[i].conn);
+		if (0 != error) {
+			free(extra_src->src_conn_params);
+			str_src_settings_free_data(extra_src);
+			free(extra_src);
+			goto err_out;
+		}
+		error = str_hub_send_msg(shbskt, ch_def->name, ch_def->name_size,
+		    STR_HUB_CMD_SRC_ADD, extra_src, (size_t)ch_def->srcs[i].type);
+		if (0 != error) {
+			free(extra_src->src_conn_params);
+			str_src_settings_free_data(extra_src);
+			free(extra_src);
+			goto err_out;
+		}
+		/* Ownership of extra_src moved to stream hub. */
+	}
 	return (0);
 
 err_out:
