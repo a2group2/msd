@@ -1630,7 +1630,11 @@ str_hub_src_on_state(str_src_p src, void *udata, uint32_t state, uint32_t status
 					break;
 				}
 			}
-			if (tm) {
+			/* Only switch to a backup source that actually exists.
+			 * Dynamic hubs usually have a single source, so do not try
+			 * to switch past the end of src[] (it would disrupt the
+			 * stream for the client). */
+			if (tm && (src_current + 1) < str_hub->src_cnt) {
 				str_hub_src_switch(str_hub, (src_current + 1));
 				syslog(LOG_INFO,
 				    "%s: switch src from %zu to %zu - backup.",
