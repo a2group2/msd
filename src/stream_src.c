@@ -66,6 +66,10 @@
 #include "stream_mpeg2ts.h"
 #include "stream_src.h"
 
+#ifdef __linux__ /* Linux specific code. */
+#include "src_dvb.h"
+#endif
+
 
 #define STR_SRC_UDP_PKT_SIZE_STD	1500	/* Standart size. */
 #define STR_SRC_UDP_PKT_SIZE_JUMBO16	16384	/* Get ready to receive jumbo frames. */
@@ -95,6 +99,12 @@ static int str_src_recv_mc_cb(tp_task_p tptask, int error, uint32_t eof,
 static int str_src_http_redirect_is_code(uint32_t status_code);
 static int str_src_http_redirect_follow(str_src_p src,
     const uint8_t *location, size_t location_size);
+
+#ifdef __linux__ /* Linux specific code. */
+int str_src_dvb_start(str_src_p src);
+static int str_src_recv_dvb_cb(tp_task_p tptask, int error, uint32_t eof,
+    size_t data2transfer_size, void *arg);
+#endif
 
 void	str_src_r_buf_f_name_gen(str_src_p src);
 int	str_src_r_buf_alloc(str_src_p src, const int keep_tail_data);
@@ -155,6 +165,20 @@ str_src_timer_proc(str_src_p src, struct timespec *ts_now, struct timespec *ts_p
 		src->baud_rate = 0;
 		return (0);
 	}
+	#ifdef __linux__ /* Linux specific code. */
+	/* Report DVB frontend lock state as source status. */
+	if (STR_SRC_TYPE_DVB == src->type && NULL != src->dvb_src) {
+		fe_status_t fst = 0;
+		if (0 == src_dvb_fe_status_get((src_dvb_p)src->dvb_src, &fst)) {
+			error = str_src_state_update(src, STR_SRC_STATE_CURRENT,
+			    (0 == (FE_HAS_LOCK & fst)) ?
+			    SRC_STATUS_SET_BIT : SRC_STATUS_CLR_BIT,
+			    STR_SRC_STATUS_ERROR);
+			if (0 != error)
+				return (error);
+		}
+	}
+#endif
 	/* No traffic check. */
 	if (0 != src->s.skt_opts.rcv_timeout) {
 		tmt = (src->last_recv_time.tv_sec + (time_t)src->s.skt_opts.rcv_timeout);
@@ -387,6 +411,11 @@ str_src_conn_def(uint32_t type, str_src_conn_params_p src_conn_params) {
 		src_conn_params->tcp.retry_interval = STR_SRC_CONN_DEF_RETRY_INTERVAL;
 		src_conn_params->tcp.conn_try_count = STR_SRC_CONN_DEF_TRY_COUNT;
 		break;
+#ifdef __linux__ /* Linux specific code. */
+	case STR_SRC_TYPE_DVB:
+		src_dvb_conn_def(&src_conn_params->dvb);
+		break;
+#endif
 	default:
 		break;
 	}
@@ -465,6 +494,11 @@ str_src_conn_xml_load_settings(const uint8_t *buf, size_t buf_size,
 			    &((str_src_conn_http_p)conn)->cust_http_hdrs_size);
 		}
 		break;
+#ifdef __linux__ /* Linux specific code. */
+	case STR_SRC_TYPE_DVB:
+		return (src_dvb_conn_xml_load(buf, buf_size,
+		    (str_src_conn_dvb_p)conn));
+#endif
 	default:
 		break;
 	}
@@ -592,6 +626,10 @@ str_src_create(uint32_t type, str_src_settings_p s, tpt_p tpt,
 	case STR_SRC_TYPE_TCP:
 	case STR_SRC_TYPE_TCP_HTTP:
 		break;
+#ifdef __linux__ /* Linux specific code. */
+	case STR_SRC_TYPE_DVB:
+		break;
+#endif
 	default:
 		return (EINVAL);
 	}
@@ -673,6 +711,15 @@ str_src_destroy(str_src_p src) {
 		return;
 
 	str_src_stop(src);
+
+#ifdef __linux__ /* Linux specific code. */
+	/* Free DVB source if it was not stopped (e.g. state already STOP). */
+	if (NULL != src->dvb_src) {
+		src_dvb_stop((src_dvb_p)src->dvb_src);
+		src_dvb_destroy((src_dvb_p)src->dvb_src);
+		src->dvb_src = NULL;
+	}
+#endif
 
 	switch (src->type) {
 	case STR_SRC_TYPE_TCP:
@@ -760,6 +807,10 @@ str_src_start(str_src_p src) {
 	case STR_SRC_TYPE_TCP:
 	case STR_SRC_TYPE_TCP_HTTP:
 		return (str_src_connect(src, 0));
+#ifdef __linux__ /* Linux specific code. */
+	case STR_SRC_TYPE_DVB:
+		return (str_src_dvb_start(src));
+#endif
 	}
 	return (0);
 err_out:
@@ -805,6 +856,21 @@ str_src_stop(str_src_p src) {
 	case STR_SRC_TYPE_TCP:
 	case STR_SRC_TYPE_TCP_HTTP:
 		break;
+#ifdef __linux__ /* Linux specific code. */
+	case STR_SRC_TYPE_DVB:
+		/* Destroy IO task (dvr fd is owned by src_dvb). */
+		if (NULL != src->tptask) {
+			tp_task_destroy(src->tptask);
+			src->tptask = NULL;
+		}
+		/* Close demux/dvr and stop the frontend. */
+		if (NULL != src->dvb_src) {
+			src_dvb_stop((src_dvb_p)src->dvb_src);
+			src_dvb_destroy((src_dvb_p)src->dvb_src);
+			src->dvb_src = NULL;
+		}
+		break;
+#endif
 	}
 	tp_task_destroy(src->tptask);
 	src->tptask = NULL;
@@ -1516,6 +1582,148 @@ chunk_retry:
 	return (TP_TASK_CB_CONTINUE);
 }
 
+
+#ifdef __linux__ /* Linux specific code. */
+/* Start DVB source: tune frontend, install PID filters, open DVR. */
+int
+str_src_dvb_start(str_src_p src) {
+	int error;
+	uintptr_t dvr_fd;
+	src_dvb_p dvb;
+
+	if (NULL == src)
+		return (EINVAL);
+
+	/* PNR (program number) mode needs the MPEG-TS analyzer to discover
+	 * PMT/ES PIDs from PAT/PMT, so make sure it is enabled. */
+	if (0 != src->s.src_conn_params->dvb.pnr &&
+	    0 == (STR_SRC_S_F_M2TS_ANALYZING & src->s.flags)) {
+		src->s.flags |= STR_SRC_S_F_M2TS_ANALYZING;
+		SYSLOGD_EX(LOG_INFO, "DVB: enabled MPEG-TS analyzer for PNR mode.");
+	}
+
+	/* Create DVB frontend object on first start. */
+	if (NULL == src->dvb_src) {
+		error = src_dvb_create(&src->s.src_conn_params->dvb, src->tpt,
+		    NULL, src, (src_dvb_p*)&src->dvb_src);
+		if (0 != error) {
+			SYSLOG_ERR(LOG_ERR, error, "src_dvb_create().");
+			src->last_err = error;
+			str_src_state_update(src, STR_SRC_STATE_STOP,
+			    SRC_STATUS_SET_BIT, STR_SRC_STATUS_ERROR);
+			return (error);
+		}
+	}
+	dvb = (src_dvb_p)src->dvb_src;
+
+	/* Tune frontend, install demux PID filters, open DVR. */
+	error = src_dvb_start(dvb, &dvr_fd);
+	if (0 != error) {
+		SYSLOG_ERR(LOG_ERR, error, "src_dvb_start().");
+		goto err_out;
+	}
+	/* Create IO task for DVR device. */
+	error = tp_task_notify_create(src->tpt, dvr_fd,
+	    0, TP_EV_READ, 0, str_src_recv_dvb_cb, src, &src->tptask);
+	if (0 != error) {
+		SYSLOG_ERR(LOG_ERR, error, "tp_task_notify_create().");
+		goto err_out;
+	}
+	return (str_src_state_update(src, STR_SRC_STATE_DATA_WAITING, 0, 0));
+err_out:
+	src->last_err = error;
+	if (NULL != src->tptask) {
+		tp_task_destroy(src->tptask);
+		src->tptask = NULL;
+	}
+	if (NULL != src->dvb_src) {
+		src_dvb_stop((src_dvb_p)src->dvb_src);
+		src_dvb_destroy((src_dvb_p)src->dvb_src);
+		src->dvb_src = NULL;
+	}
+	str_src_state_update(src, STR_SRC_STATE_STOP,
+	    SRC_STATUS_SET_BIT, STR_SRC_STATUS_ERROR);
+	return (error);
+}
+
+static int
+str_src_recv_dvb_cb(tp_task_p tptask, int error, uint32_t eof __unused,
+    size_t data2transfer_size __unused, void *arg) {
+	str_src_p src = arg;
+	uintptr_t ident;
+	uint8_t *buf;
+	ssize_t ios;
+	size_t buf_size, tm, used, read_cnt = 0, transfered_size = 0;
+	struct timespec ts;
+
+	if (0 != error) {
+err_out:
+		SYSLOG_ERR(LOG_DEBUG, error, "On receive.");
+		str_src_stop(src);
+		src->last_err = error;
+		str_src_state_update(src, STR_SRC_STATE_STOP,
+		    SRC_STATUS_SET_BIT, STR_SRC_STATUS_ERROR);
+		return (TP_TASK_CB_NONE); /* Receiver destroyed. */
+	}
+	if (NULL == src->r_buf) { /* Delay ring buf allocation. */
+		error = str_src_r_buf_alloc(src, 1);
+		if (0 != error)
+			goto err_out;
+		error = str_src_state_update(src, STR_SRC_STATE_RUNNING, 0, 0);
+		if (0 != error)
+			return (TP_TASK_CB_NONE); /* Receiver destroyed. */
+	}
+
+	clock_gettime(CLOCK_MONOTONIC_FAST, &ts);
+	ident = tp_task_ident_get(tptask);
+	while (1) { /* DVR read loop. */
+		/* r_buf handles inside data move from tail to head on round
+		 * complete, so r_buf_w_off is always valid. */
+		buf_size = r_buf_wbuf_get(src->r_buf,
+		    (src->r_buf_w_off + (MPEG2_TS_PKT_SIZE_MAX * 2)), &buf);
+		tm = buf_size;
+		buf_size -= (src->r_buf_w_off + (buf_size % MPEG2_TS_PKT_SIZE_188));
+		ios = read((int)ident, (buf + src->r_buf_w_off), buf_size);
+		if (0 > ios) {
+			error = errno;
+			if (0 == error) {
+				error = EINVAL;
+			}
+			error = SKT_ERR_FILTER(error);
+			if (0 == error) /* No more data now. */
+				break;
+			goto err_out;
+		}
+		if (0 == ios) /* EOF. */
+			break;
+		read_cnt ++;
+		transfered_size += (size_t)ios;
+		/* Buf used size (includes partially received tail). */
+		used = (src->r_buf_w_off + (size_t)ios);
+		if (MPEG2_TS_PKT_SIZE_188 > used) { /* Partial packet. */
+			src->r_buf_w_off = used;
+			if (64 <= read_cnt)
+				break;
+			continue;
+		}
+		/* Commit full TS packets, keep the partial trailing tail. */
+		str_src_r_buf_add(src, &ts, buf, used, &src->r_buf_w_off);
+		if (64 <= read_cnt)
+			break;
+	} /* end recv while */
+	/* PNR mode: subscribe PMT/ES PIDs as the analyzer discovers them. */
+	if (NULL != src->dvb_src) {
+		src_dvb_pnr_sync((src_dvb_p)src->dvb_src, src->m2ts);
+	}
+	/* Calc speed. */
+	src->received_count += transfered_size;
+	memcpy(&src->last_recv_time, &ts, sizeof(struct timespec));
+	if (NULL != src->on_data) {
+		src->on_data(src, &src->last_recv_time, src->udata);
+	}
+	return (TP_TASK_CB_CONTINUE);
+}
+#endif /* __linux__ */
 
 /* MPEG payload-type constants - adopted from VLC 0.8.6 */
 #define P_MPGA		0x0E /* MPEG audio */

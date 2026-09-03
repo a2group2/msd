@@ -84,6 +84,29 @@ typedef struct str_src_conn_http_s {
 	size_t		cust_http_hdrs_size;
 } str_src_conn_http_t, *str_src_conn_http_p;
 
+/* DVB source (digital TV frontend/demux/dvr, Linux only). */
+#define STR_SRC_DVB_PIDS_MAX	64	/* Max number of TS PIDs to filter. */
+typedef struct str_src_conn_dvb_s {
+	uint32_t	adapter_idx;	/* DVB adapter number (/dev/dvb/adapterX). */
+	uint32_t	fe_idx;		/* Frontend number (/dev/dvb/adapterX/frontendY). */
+	uint32_t	dmx_idx;	/* Demux/DVR number (/dev/dvb/adapterX/demuxY, dvrY). */
+	uint32_t	dmx_buf_size;	/* DMX_SET_BUFFER_SIZE in kB (0 = driver default). */
+	uint32_t	dvr_buf_size;	/* DVR read buffer size in kB (0 = 256 kB, hint). */
+	uint32_t	delivery_sys;	/* fe_delivery_system_t: SYS_DVBT, SYS_DVBS2... 0 = SYS_UNDEFINED. */
+	uint32_t	frequency;	/* Hz. For satellite: LNB output (IF) frequency. */
+	uint32_t	symbol_rate;	/* Sym/s (satellite/cable). */
+	uint32_t	modulation;	/* fe_modulation_t. */
+	uint32_t	fec;		/* fe_code_rate_t (inner FEC). */
+	uint32_t	spec_inv;	/* fe_spectral_inversion_t. */
+	uint32_t	rolloff;	/* fe_rolloff_t. */
+	uint32_t	bandwidth;	/* fe_bandwidth_t (terrestrial). */
+	uint32_t	stream_id;	/* DTV_STREAM_ID (DVB-T2 PLP), SRC_DVB_STREAM_ID_NONE = all. */
+	uint32_t	pnr;		/* Program Number (PNR) to select. 0 = whole transponder (all PIDs). PIDs are auto-discovered from PAT/PMT. */
+	uint16_t	pids[STR_SRC_DVB_PIDS_MAX]; /* TS PIDs to filter, empty = all PIDs. */
+	uint8_t		pids_count;
+} str_src_conn_dvb_t, *str_src_conn_dvb_p;
+#define SRC_DVB_STREAM_ID_NONE	((uint32_t)~0)
+
 #define STR_SRC_CONN_DEF_IFINDEX	((uint32_t)-1)
 #define STR_SRC_CONN_DEF_CONN_TIMEOUT	(10)	/* s */
 #define STR_SRC_CONN_DEF_RETRY_INTERVAL	(5)	/* s */
@@ -99,6 +122,7 @@ typedef union str_src_conn_params_s {
 	str_src_conn_mc_t	mc;
 	str_src_conn_tcp_t	tcp;
 	str_src_conn_http_t	http;
+	str_src_conn_dvb_t	dvb;
 } str_src_conn_params_t, *str_src_conn_params_p;
 
 
@@ -150,6 +174,9 @@ typedef struct str_src_settings_s {
 typedef struct str_src_s {
 	tp_task_p	tptask;		/* Data/Packets receiver. */
 	uint32_t	type;		/* STR_SRC_TYPE_* */
+#ifdef __linux__ /* Linux specific code. */
+	void		*dvb_src;	/* DVB source (STR_SRC_TYPE_DVB). */
+#endif /* Linux specific code. */
 	r_buf_p		r_buf;		/* Ring buf, write pos. */
 	size_t		r_buf_w_off;	/* Write offset in r_buf, used in TCP recv. */
 #ifdef __linux__ /* Linux specific code. */
@@ -194,7 +221,8 @@ typedef struct str_src_s {
 #define STR_SRC_TYPE_MULTICAST_RTP	4
 #define STR_SRC_TYPE_TCP		5
 #define STR_SRC_TYPE_TCP_HTTP		6
-#define STR_SRC_TYPE___COUNT__		7
+#define STR_SRC_TYPE_DVB		7
+#define STR_SRC_TYPE___COUNT__		8
 static const char *str_src_types[] = {
 	"unknown",
 	"udp",
@@ -203,6 +231,7 @@ static const char *str_src_types[] = {
 	"multicast-udp-rtp",
 	"tcp",
 	"tcp-http",
+	"dvb",
 	NULL
 };
 static const size_t str_src_types_sizes[] = {
@@ -213,6 +242,7 @@ static const size_t str_src_types_sizes[] = {
 	17,
 	3,
 	8,
+	3,
 	0
 };
 

@@ -21,6 +21,11 @@ set(MSD_BIN		msd.c
 			liblcb/src/utils/ring_buffer.c
 			liblcb/src/utils/xml.c)
 
+if (CMAKE_SYSTEM_NAME MATCHES "Linux")
+	# DVB (digital TV tuner) source support: frontend/demux/DVR.
+	list(APPEND MSD_BIN dvb_fe.c src_dvb.c)
+endif()
+
 add_executable(msd ${MSD_BIN})
 target_compile_definitions(msd PRIVATE -DMPEG2TS_XML_CONFIG)
 target_compile_definitions(msd PRIVATE -DHTTP_SRV_XML_CONFIG)

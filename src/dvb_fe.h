@@ -32,7 +32,10 @@
 
 #include <sys/param.h>
 #include <sys/types.h>
+#include <sys/ioctl.h> /* _IOR/_IOW etc (ioctl defs on Linux, BSD). */
+#ifndef __linux__ /* Linux: ioctl defs are in <sys/ioctl.h>. */
 #include <sys/ioccom.h>
+#endif
 #include <linux/dvb/version.h>
 #include <linux/dvb/frontend.h>
 

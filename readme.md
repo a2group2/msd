@@ -89,3 +89,90 @@ Run:
 service msd restart
 ```
 
+## DVB (digital TV tuner) support
+
+Built-in DVB-карт support (Linux only, requires `/dev/dvb/adapter*/frontend*`,
+`demux*`, `dvr*` devices). A DVB channel is a regular msd channel whose
+source `<type>` is `dvb`:
+
+```xml
+<channel>
+	<name>dvb-t2.ts</name>
+	<hubProfileName>default</hubProfileName>
+	<sourceList>
+		<source>
+			<type>dvb</type>
+			<dvb>
+				<adapter>0</adapter>
+				<frontend>0</frontend>
+				<demux>0</demux>
+				<dmxBufSize>2048</dmxBufSize>
+				<deliverySystem>DVBT2</deliverySystem>
+				<frequency>578000000</frequency>
+				<bandwidth>8MHZ</bandwidth>
+			</dvb>
+		</source>
+	</sourceList>
+</channel>
+```
+
+See `conf/msd_channels_dvb.conf` for a complete example and a satellites (DVB-S/S2)
+example. Request the channel as any other:
+`http://<msd-ip>:<port>/channel/dvb-t2.ts`.
+
+### Выбор программы (PNR)
+
+На одном транспондере обычно несколько телеканалов. Параметр `pnr` задаёт
+**номер программы** (Program Number), которую нужно вещать:
+
+```xml
+<dvb>
+	<deliverySystem>DVBT2</deliverySystem>
+	<frequency>578000000</frequency>
+	<bandwidth>8MHZ</bandwidth>
+	<pnr>1</pnr>   <!-- выбрать программу номер 1 (0 = весь транспондер) -->
+</dvb>
+```
+
+При `pnr > 0` msd сам находит PIDs канала по PAT/PMT:
+1. подписывается на PID 0 (PAT);
+2. из PAT находит PMT PID по номеру программы;
+3. из PMT получает список ES-PIDs (видео/аудио) и подписывает их на demux.
+
+Так как номера программ на разных транспондерах/провайдерах отличаются,
+подберите `pnr` экспериментально (помогает `dvbscan`, или перечислите
+доступные программы через `/stat` — msd показывает список
+`Programm: <номер> [PID: ...]` для каждого распознанного канала при
+`pnr = 0`).
+
+### `<dvb>` keys
+
+| Key | Meaning | Default |
+|---|---|---|
+| `adapter` | DVB adapter number (`/dev/dvb/adapterX`) | 0 |
+| `frontend` | Frontend number (`.../frontendY`) | 0 |
+| `demux` | Demux/DVR number (`.../demuxY`, `.../dvrY`) | 0 |
+| `dmxBufSize` | Demux buffer size in kB (`DMX_SET_BUFFER_SIZE`) | 2048 |
+| `dvrBufSize` | DVR read buffer size in kB (hint) | 256 |
+| `deliverySystem` | `DVBT`, `DVBT2`, `DVBS`, `DVBS2`, `DVBC`, `ATSC`, `ISDBT`, or numeric `SYS_*` | required |
+| `frequency` | Hz. Satellite: LNB output (IF) frequency | 0 |
+| `symbolRate` | Sym/s (satellite/cable) | 0 |
+| `modulation` | `QPSK`, `8PSK`, `QAM16`, `QAM64`, `QAM256`, `VSB8`... or numeric | QAM_AUTO |
+| `fec` | `1_2`..`9_10`, `AUTO`, or numeric | FEC_AUTO |
+| `inversion` | `ON`, `OFF`, `AUTO` | INVERSION_AUTO |
+| `rolloff` | `0.35`, `0.20`, `0.25`, `AUTO` | ROLLOFF_AUTO |
+| `bandwidth` | Text only: `5MHZ`, `6MHZ`, `7MHZ`, `8MHZ`, `10MHZ`, `AUTO` | BANDWIDTH_AUTO |
+| `streamId` | DVB-T2 PLP (`DTV_STREAM_ID`) | all PIDs |
+| `pnr` | **Program Number** to select. PIDs are auto-discovered from PAT/PMT (PAT → PMT → ES PIDs are subscribed dynamically on the demux device). `0` = whole transponder | 0 (all PIDs) |
+| `pidsList` | `pid` list to filter; empty = all PIDs. **Ignored when `pnr` is set** (PID 0/PAT is auto-subscribed) | all PIDs |
+
+Implementation notes:
+* The frontend driver (`dvb_fe.c`) uses DVBv5 S2API with DVBv3 `FE_SET_FRONTEND`
+  fallback.
+* TS PIDs are filtered on the demux device (Astra-style `DMX_SET_PES_FILTER`),
+  the resulting MPEG-TS is read from the DVR device and fed into the regular
+  msd ring buffer / MPEG-TS analyzer pipeline.
+* FE lock status is reported in `/stat` and in syslog (`FE_HAS_LOCK` / lock lost).
+* The only writing part is `src_dvb.c` (demux/DVR/config) - the frontend part
+  (`dvb_fe.c`) already existed in the tree. DVB code is compiled only on Linux.
+
