@@ -61,6 +61,9 @@ typedef struct str_src_conn_mc_s {
 } str_src_conn_mc_t, *str_src_conn_mc_p;
 
 #define STR_SRC_CONN_TCP_MAX_ADDRS	8
+/* Max number of HTTP redirects (301, 302, 303, 307, 308) to follow
+ * before giving up, to avoid infinite redirect loops. */
+#define STR_SRC_HTTP_MAX_REDIRECTS	5
 /* TCP source */
 typedef struct str_src_conn_tcp_s {
 	const uint8_t	*host;		/* Point to mem in req_buf for conn_http. */
@@ -82,6 +85,17 @@ typedef struct str_src_conn_http_s {
 	size_t		url_path_size;
 	const uint8_t	*cust_http_hdrs;
 	size_t		cust_http_hdrs_size;
+	/* Redirect tracking (used to revert to the original URL after
+	 * repeated 5xx errors on a redirect target, e.g. stale Acestream
+	 * redirects). orig_* fields are zeroed only on create/destroy. */
+	char		orig_url[512];		/* Original request host[:port]. */
+	char		orig_path[2048];	/* Original request path (with leading '/'). */
+	uint16_t	orig_port;		/* Original request port (0 = HTTP default). */
+	char		current_url[2048];	/* Currently active target (host/path). */
+	char		redirect_chain[STR_SRC_HTTP_MAX_REDIRECTS][512]; /* Redirect history. */
+	uint8_t		redirect_count;		/* Current redirect depth. */
+	time_t		redirect_expiry;	/* Redirect cache expiration time. */
+	uint8_t		consecutive_errors;	/* Consecutive 5xx error count. */
 } str_src_conn_http_t, *str_src_conn_http_p;
 
 /* DVB source (digital TV frontend/demux/dvr, Linux only). */
@@ -111,10 +125,6 @@ typedef struct str_src_conn_dvb_s {
 #define STR_SRC_CONN_DEF_CONN_TIMEOUT	(10)	/* s */
 #define STR_SRC_CONN_DEF_RETRY_INTERVAL	(5)	/* s */
 #define STR_SRC_CONN_DEF_TRY_COUNT	(~((uint64_t)0))
-
-/* Max number of HTTP redirects (301, 302, 303, 307, 308) to follow
- * before giving up, to avoid infinite redirect loops. */
-#define STR_SRC_HTTP_MAX_REDIRECTS	5
 
 
 typedef union str_src_conn_params_s {
@@ -196,7 +206,6 @@ typedef struct str_src_s {
 	int		last_err;	/* Last errno. */
 	uint32_t	http_resp_code;	/* Last http error code. */
 	int		http_te;	/* HTTP transfer encoding. */
-	int		http_retry_forever; /* HTTP 5xx seen: keep retrying regardless of reconnectCount. */
 	size_t		http_te_chunk;	/* transfer encoding chunk size. */
 	size_t		http_redirect_count; /* Count of http redirects (3xx) followed for current request. */
 	uint32_t	rtp_sn;		/* Continuity/Sequence number. */

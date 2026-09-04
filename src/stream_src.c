@@ -89,6 +89,7 @@ int	str_src_connect(str_src_p src, int retry);
 int	str_src_connect_retry(str_src_p src);
 static void str_src_conn_err_reconnect(str_src_p src, int error);
 static void str_src_conn_err_fatal(str_src_p src, int error);
+static int str_src_http_revert_to_orig(str_src_p src);
 static int str_src_connected(tp_task_p tptask, int error, void *arg);
 static int str_src_send_http_req_done_cb(tp_task_p tptask, int error,
 	    io_buf_p buf, uint32_t eof, size_t transfered_size, void *arg);
@@ -161,6 +162,14 @@ str_src_timer_proc(str_src_p src, struct timespec *ts_now, struct timespec *ts_p
 			    src->last_recv_time.tv_nsec > ts_now->tv_nsec))
 				return (0); /* Reconnect later (not yet). */
 		}
+		/* HTTP redirect cache expired: revert to the original URL so
+		 * the redirect chain is replayed from scratch on reconnect. */
+		if (STR_SRC_TYPE_TCP_HTTP == src->type &&
+		    0 != src->s.src_conn_params->http.redirect_count &&
+		    0 != src->s.src_conn_params->http.redirect_expiry &&
+		    src->s.src_conn_params->http.redirect_expiry < time(NULL)) {
+			str_src_http_revert_to_orig(src);
+		}
 		str_src_connect(src, 1);
 		/* Passtrouth. */
 	default: /* No process. */
@@ -193,7 +202,8 @@ str_src_timer_proc(str_src_p src, struct timespec *ts_now, struct timespec *ts_p
 				 * automatic reconnect. */
 				if (STR_SRC_STATE_RUNNING == src->state ||
 				    STR_SRC_STATE_DATA_WAITING == src->state ||
-				    STR_SRC_STATE_DATA_REQ == src->state) {
+				    STR_SRC_STATE_DATA_REQ == src->state ||
+				    STR_SRC_STATE_RECONNECTING == src->state) {
 					error = str_src_connect_retry(src);
 					if (0 != error)
 						SYSLOG_ERR(LOG_NOTICE, error,
@@ -711,6 +721,20 @@ str_src_init(str_src_p src) {
 	src->http_te_chunk = 0;
 	//src->rtp_sn = 0;
 	//src->rtp_sn_errors = 0;
+	/* Reset HTTP redirect tracking for the new connection session.
+	 * NOTE: orig_url/orig_path are intentionally kept: they describe
+	 * the user-configured original URL and are reused to revert back
+	 * to it after repeated 5xx errors on a redirect target. They are
+	 * zeroed only on str_src_create()/str_src_destroy(). */
+	if (NULL != src->s.src_conn_params &&
+	    STR_SRC_TYPE_TCP_HTTP == src->type) {
+		str_src_conn_http_p http = &src->s.src_conn_params->http;
+
+		http->redirect_count = 0;
+		http->redirect_expiry = 0;
+		http->consecutive_errors = 0;
+	}
+	src->http_redirect_count = 0;
 }
 
 void
@@ -940,7 +964,9 @@ str_src_connect(str_src_p src, int retry) {
 		sa_addr_port_to_str(&conn_tcp->addr[conn_tcp->addr_index], straddr,
 		    sizeof(straddr), NULL);
 		conn_tcp->conn_try ++;
-		if (0 != src->http_retry_forever) /* HTTP 5xx: keep retrying this addr forever. */
+		/* If the last HTTP response was a 5xx server error, keep retrying
+		 * this address indefinitely (ignore reconnectCount). */
+		if (500 <= src->http_resp_code && src->http_resp_code < 600)
 			conn_tcp->conn_try = 0;
 		syslog(LOG_INFO, "Retry %"PRIu64"/%"PRIu64" connect to %s...",
 		    conn_tcp->conn_try, conn_tcp->conn_try_count, straddr);
@@ -1275,6 +1301,28 @@ str_src_http_redirect_follow(str_src_p src, const uint8_t *location,
 	}
 	path_buf[path_size] = 0;
 
+	/* Save the original (pre-redirect) request on the first redirect,
+	 * so we can revert back to it after repeated 5xx errors on a
+	 * redirect target (stale Acestream redirects). NOTE: tcp.host and
+	 * url_path point inside req_buf and are NOT NUL-terminated, so
+	 * copy with explicit sizes. Must be done BEFORE the request buffer
+	 * is regenerated below. */
+	if (0 == conn_http->orig_url[0] && 0 != conn_tcp->host_size) {
+		size_t cp = MIN(conn_tcp->host_size,
+		    (sizeof(conn_http->orig_url) - 1));
+		memcpy(conn_http->orig_url, conn_tcp->host, cp);
+		conn_http->orig_url[cp] = 0;
+		cp = MIN(conn_http->url_path_size,
+		    (sizeof(conn_http->orig_path) - 1));
+		if (0 != cp) {
+			memcpy(conn_http->orig_path, conn_http->url_path, cp);
+		}
+		conn_http->orig_path[cp] = 0;
+		conn_http->orig_port = def_port;
+		syslog(LOG_INFO, "HTTP redirect: original URL stored: "
+		    "http://%s/%s", conn_http->orig_url, conn_http->orig_path);
+	}
+
 	/* Resolve new destination address(es).
 	 * Try literal IP[:port] first (no blocking), then fall back to a
 	 * (blocking) DNS resolve: str_src has no async resolver wired in,
@@ -1321,10 +1369,126 @@ str_src_http_redirect_follow(str_src_p src, const uint8_t *location,
 	}
 
 	src->http_redirect_count ++;
+	/* Record this redirect in the chain (host_buf is NUL-terminated). */
+	if (conn_http->redirect_count < STR_SRC_HTTP_MAX_REDIRECTS) {
+		strncpy(conn_http->redirect_chain[conn_http->redirect_count],
+		    (const char*)host_buf,
+		    (sizeof(conn_http->redirect_chain[0]) - 1));
+		conn_http->redirect_chain[conn_http->redirect_count][
+		    (sizeof(conn_http->redirect_chain[0]) - 1)] = 0;
+	}
+	conn_http->redirect_count ++;
+	/* Update current target URL for diagnostics.
+	 * Precision limits match buffer sizes: host_buf[256], path_buf[2048]
+	 * and current_url[2048], so no truncation warning is possible. */
+	snprintf(conn_http->current_url, sizeof(conn_http->current_url),
+	    "%.255s/%.1791s", host_buf, path_buf);
+	/* Redirect cache is valid for 5 minutes, then a reconnect should
+	 * replay the full redirect chain from the original URL. */
+	conn_http->redirect_expiry = (time(NULL) + 300);
+
 	syslog(LOG_INFO,
 	    "HTTP redirect (%zu/%i): following to: http://%s/%s",
 	    src->http_redirect_count, STR_SRC_HTTP_MAX_REDIRECTS,
 	    host_buf, path_buf);
+
+	return (0);
+}
+
+/*
+ * Revert an HTTP source back to its original (pre-redirect) URL:
+ * regenerate the HTTP request and re-resolve the original address(es).
+ * Used after repeated 5xx errors on a redirect target: the redirect
+ * may be stale (e.g. dead Acestream engine session), so we go back to
+ * the user-configured URL and replay the redirect chain from scratch.
+ * Ret value: 0 - OK, ready to (re)connect; non zero - error.
+ */
+static int
+str_src_http_revert_to_orig(str_src_p src) {
+	str_src_conn_http_p conn_http;
+	str_src_conn_tcp_p conn_tcp;
+	host_addr_p haddr;
+	const uint8_t *opath;
+	size_t opath_size, i;
+	sockaddr_storage_t addr;
+	uint16_t def_port;
+	int error;
+
+	if (NULL == src || STR_SRC_TYPE_TCP_HTTP != src->type)
+		return (EINVAL);
+
+	conn_http = &src->s.src_conn_params->http;
+	conn_tcp = &conn_http->tcp;
+	if (0 == conn_http->orig_url[0])
+		return (ENOENT); /* No original URL stored: nothing to do. */
+
+	def_port = ((0 != conn_http->orig_port) ?
+	    conn_http->orig_port : HTTP_PORT);
+
+	/* Skip leading '/': str_src_conn_http_gen_request() adds it back
+	 * via its "GET /" prefix (orig_path is stored with the slash). */
+	opath = (const uint8_t*)conn_http->orig_path;
+	opath_size = strlen(conn_http->orig_path);
+	if (0 != opath_size && '/' == opath[0]) {
+		opath ++;
+		opath_size --;
+	}
+
+	syslog(LOG_WARNING, "HTTP source: reverting to original URL: "
+	    "http://%s/%s", conn_http->orig_url, conn_http->orig_path);
+
+	/* Regenerate request for the original host/path. */
+	io_buf_free(conn_http->req_buf);
+	conn_http->req_buf = NULL;
+	error = str_src_conn_http_gen_request(
+	    (const uint8_t*)conn_http->orig_url,
+	    strlen(conn_http->orig_url), opath, opath_size, NULL, 0,
+	    conn_http);
+	if (0 != error) {
+		SYSLOG_ERR(LOG_ERR, error,
+		    "str_src_conn_http_gen_request() on revert to orig.");
+		return (error);
+	}
+
+	/* Re-resolve original destination address(es): literal IP[:port]
+	 * first (no blocking), then (blocking) DNS resolve. */
+	memset(&addr, 0x00, sizeof(addr));
+	conn_tcp->addr_count = 0;
+	conn_tcp->addr_index = 0;
+	if (0 == sa_addr_port_from_str(&addr,
+	    (const char*)conn_http->orig_url,
+	    strlen(conn_http->orig_url))) {
+		if (0 == sa_port_get(&addr)) {
+			sa_port_set(&addr, def_port);
+		}
+		memcpy(&conn_tcp->addr[0], &addr, sizeof(addr));
+		conn_tcp->addr_count = 1;
+	} else {
+		haddr = host_addr_alloc(
+		    (const uint8_t*)conn_http->orig_url,
+		    strlen(conn_http->orig_url), def_port);
+		if (NULL == haddr)
+			return (ENOMEM);
+		if (0 != host_addr_resolv(haddr) || 0 == haddr->count) {
+			syslog(LOG_ERR,
+			    "HTTP revert: cant resolve host: %s",
+			    conn_http->orig_url);
+			host_addr_free(haddr);
+			return (EADDRNOTAVAIL);
+		}
+		for (i = 0; i < haddr->count && i < STR_SRC_CONN_TCP_MAX_ADDRS; i ++) {
+			memcpy(&conn_tcp->addr[i], &haddr->addrs[i],
+			    sizeof(sockaddr_storage_t));
+		}
+		conn_tcp->addr_count = i;
+		host_addr_free(haddr);
+	}
+
+	/* We are back at the original URL: reset redirect tracking. */
+	conn_http->redirect_count = 0;
+	conn_http->redirect_expiry = 0;
+	src->http_redirect_count = 0;
+	conn_http->current_url[0] = 0;
 
 	return (0);
 }
@@ -1432,15 +1596,25 @@ err_out:
 		}
 		/* HTTP server error (5xx): source temporarily unavailable
 		 * (e.g. Acestream engine still starting). Treat as retryable:
-		 * keep reconnecting forever (reconnectInterval apart), the flag
-		 * makes str_src_connect() ignore reconnectCount exhaustion, so
-		 * the source comes back as soon as the server returns 200. */
+		 * keep reconnecting forever (reconnectInterval apart), ignoring
+		 * reconnectCount exhaustion, so the source comes back as soon
+		 * as the server returns 200. */
 		if (500 <= resp_data.status_code && 600 > resp_data.status_code) {
 			src->http_resp_code = resp_data.status_code;
-			src->http_retry_forever = 1;
+			/* Track consecutive 5xx errors: after 3 in a row on a
+			 * redirect target, revert to the original (pre-redirect)
+			 * URL: the redirect may be stale. */
+			src->s.src_conn_params->http.consecutive_errors ++;
+			if (3 <= src->s.src_conn_params->http.consecutive_errors &&
+			    0 != src->s.src_conn_params->http.redirect_count &&
+			    0 == str_src_http_revert_to_orig(src)) {
+				src->s.src_conn_params->http.consecutive_errors = 0;
+			}
 			syslog(LOG_WARNING,
 			    "HTTP source resp: status %"PRIu32" - source not ready, "
-			    "will keep retrying.", resp_data.status_code);
+			    "will keep retrying (consecutive errors: %u).",
+			    resp_data.status_code,
+			    src->s.src_conn_params->http.consecutive_errors);
 			str_src_conn_err_reconnect(src, EBUSY);
 			return (TP_TASK_CB_NONE); /* Receiver destroyed. */
 		}
@@ -1448,14 +1622,16 @@ err_out:
 		 * (e.g. 404 Not Found, 403 Forbidden). Stop the source. */
 		if (400 <= resp_data.status_code && 500 > resp_data.status_code) {
 			src->http_resp_code = resp_data.status_code;
-			src->http_retry_forever = 0;
 			syslog(LOG_ERR,
 			    "HTTP source resp: status %"PRIu32" - fatal, stop source.",
 			    resp_data.status_code);
 			str_src_conn_err_fatal(src, EACCES);
 			return (TP_TASK_CB_NONE); /* Receiver destroyed. */
 		}
-		src->http_retry_forever = 0;
+		/* Reset consecutive error counter on successful response (2xx/3xx) */
+		if (resp_data.status_code < 400) {
+			src->s.src_conn_params->http.consecutive_errors = 0;
+		}
 		/* Transfer encoding support. */
 		src->http_te = HTTP_REQ_TE_NONE;
 		if (0 == http_hdr_val_get(buf, (size_t)(ptm - buf),
