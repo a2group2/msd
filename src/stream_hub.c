@@ -522,6 +522,42 @@ str_hubs_bckt_timer_service(str_hubs_bckt_p shbskt, str_hub_p str_hub,
 			str_hub->baud_rate = 0;
 		}
 	}
+	/* DEBUG: starving hub detector. Hub has connected clients but
+	 * nothing was sent to them during the last timer tick(s): the
+	 * source may be stuck/reconnecting or the hub-to-client path is
+	 * broken. Fires at most once per 5 seconds with the full
+	 * hub/source state, to catch the "server stopped serving an
+	 * already playing stream after a channel switch" problem. */
+	if (0 != str_hub->cli_count &&
+	    0 == str_hub->sended_count &&
+	    (str_hub->last_starve_report + 5) < ts->tv_sec) {
+		str_src_p src_cur = ((str_hub->src_current < str_hub->src_cnt) ?
+		    str_hub->src[str_hub->src_current] : NULL);
+		str_hub_cli_p strh_cli_dbg;
+		size_t no_precache = 0, no_rpos = 0;
+
+		str_hub->last_starve_report = ts->tv_sec;
+		TAILQ_FOREACH(strh_cli_dbg, &str_hub->cli_head, next) {
+			if (0 == (STR_HUB_CLI_STATE_F_PRECACHE_DONE & strh_cli_dbg->state))
+				no_precache ++;
+			if (0 == (STR_HUB_CLI_STATE_F_RPOS_INITIALIZED & strh_cli_dbg->state))
+				no_rpos ++;
+		}
+		syslog(LOG_WARNING,
+		    "%s: STARVING: clients=%zu, src=%zu/%zu, "
+		    "src_state=%s, src_baud=%"PRIu64", src_last_recv=%ld sec ago, "
+		    "r_buf=%s, cli_no_precache=%zu, cli_no_rpos=%zu, "
+		    "hub_baud=%"PRIu64".",
+		    str_hub->name, str_hub->cli_count,
+		    str_hub->src_current, str_hub->src_cnt,
+		    ((NULL != src_cur) ?
+		    str_src_states[src_cur->state] : "NO SOURCE"),
+		    ((NULL != src_cur) ? src_cur->baud_rate : (uint64_t)0),
+		    ((NULL != src_cur) ?
+		    (long)(ts->tv_sec - src_cur->last_recv_time.tv_sec) : (long)-1),
+		    ((NULL != src_cur && NULL != src_cur->r_buf) ? "yes" : "no"),
+		    no_precache, no_rpos, str_hub->baud_rate);
+	}
 	/* Per Thread stat. */
 	stat->str_hub_count ++;
 	stat->cli_count += str_hub->cli_count;
@@ -647,6 +683,7 @@ str_hub_create(str_hubs_bckt_p shbskt, tpt_p tpt,
 	TAILQ_INIT(&str_hub->cli_head);
 	//str_hub->cli_count = 0;
 	str_hub->zero_cli_time = gettime_monotonic();
+	str_hub->last_starve_report = str_hub->zero_cli_time;
 	str_hub->tpt = tpt;
 	//str_hub->src = NULL;
 	//str_hub->src_cnt = 0;
@@ -775,8 +812,14 @@ str_hub_cli_destroy(str_hub_cli_p strh_cli) {
 	if (NULL != str_hub) {
 		sa_addr_port_to_str(&strh_cli->remonte_addr,
 		    straddr, sizeof(straddr), NULL);
-		syslog(LOG_INFO, "%s - %s: deattached, cli_count = %zu.",
-		    str_hub->name, straddr, (str_hub->cli_count - 1));
+		syslog(LOG_INFO, "%s - %s: deattached, cli_count = %zu, "
+		    "connected for %ld sec, last send %ld sec ago, "
+		    "rpos_initialized = %s.",
+		    str_hub->name, straddr, (str_hub->cli_count - 1),
+		    (long)(gettime_monotonic() - strh_cli->conn_time),
+		    (long)(gettime_monotonic() - strh_cli->last_snd_time),
+		    ((0 != (STR_HUB_CLI_STATE_F_RPOS_INITIALIZED & strh_cli->state)) ?
+		    "yes" : "no"));
 		/* Remove from stream hub. */
 		TAILQ_REMOVE(&str_hub->cli_head, strh_cli, next);
 		/* Update counters. */
@@ -899,9 +942,22 @@ str_hub_cli_attach(str_hub_p str_hub, str_hub_cli_p strh_cli) {
 	SYSLOG_ERR(LOG_WARNING, error, "%s - %s: skt_opts_apply().",
 	    str_hub->name, straddr);
 	syslog(LOG_INFO,
-	    "%s - %s: attached, cli_count = %zu, snd_block_min_size = %zu, precache = %zu.",
+	    "%s - %s: attached, cli_count = %zu, snd_block_min_size = %zu, "
+	    "precache = %zu, src: %s (baud %"PRIu64"), r_buf: %s, "
+	    "hub_baud = %"PRIu64".",
 	    str_hub->name, straddr, (str_hub->cli_count + 1),
-	    strh_cli->snd_block_min_size, strh_cli->precache);
+	    strh_cli->snd_block_min_size, strh_cli->precache,
+	    ((str_hub->src_current < str_hub->src_cnt &&
+	      NULL != str_hub->src[str_hub->src_current]) ?
+	    str_src_states[str_hub->src[str_hub->src_current]->state] : "none"),
+	    ((str_hub->src_current < str_hub->src_cnt &&
+	      NULL != str_hub->src[str_hub->src_current]) ?
+	    str_hub->src[str_hub->src_current]->baud_rate : (uint64_t)0),
+	    ((str_hub->src_current < str_hub->src_cnt &&
+	      NULL != str_hub->src[str_hub->src_current] &&
+	      NULL != str_hub->src[str_hub->src_current]->r_buf) ?
+	    "yes" : "no"),
+	    str_hub->baud_rate);
 
 	TAILQ_INSERT_HEAD(&str_hub->cli_head, strh_cli, next);
 	str_hub->cli_count ++;
@@ -1188,6 +1244,19 @@ send_start:
 		}
 		strh_cli->rpos.iov_off = 0;
 		strh_cli->state |= STR_HUB_CLI_STATE_F_HTTP_HDRS_SENDED;
+		sa_addr_port_to_str(&strh_cli->remonte_addr, straddr, sizeof(straddr), NULL);
+		SYSLOGD_EX(LOG_INFO,
+		    "%s - %s: HTTP 200 headers sent (source state: %s, "
+		    "source data: %s).",
+		    str_hub->name, straddr,
+		    ((str_hub->src_current < str_hub->src_cnt &&
+		      NULL != str_hub->src[str_hub->src_current]) ?
+		    str_src_states[str_hub->src[str_hub->src_current]->state] :
+		    "none"),
+		    ((str_hub->src_current < str_hub->src_cnt &&
+		      NULL != str_hub->src[str_hub->src_current] &&
+		      NULL != str_hub->src[str_hub->src_current]->r_buf) ?
+		    "available" : "not yet (waiting for stream)"));
 		if (STR_HUB_CLI_ST_TCP_HTTP_HEAD == strh_cli->cli_sub_type)
 			return (-1); /* Destroy me. */
 	}
