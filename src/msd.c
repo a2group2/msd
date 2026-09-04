@@ -1706,6 +1706,12 @@ err_out_dyn_client:
 				 * below uses str_addr/str_addr_size (into req_buf), so
 				 * nothing else to restore here. */
 				memcpy(&src_conn_params->tcp.addr[0], &routed_dst, sizeof(routed_dst));
+				/* The parsed destination is the single connect address:
+				 * msd_http_req_url_parse() fills addr[0] but never
+				 * updates addr_count (it stays 0 from the profile
+				 * template), while str_src_connect() refuses to
+				 * connect with an empty address list. */
+				src_conn_params->tcp.addr_count = 1;
 			}
 			/* Generate http request */
 			ptm = (str_addr + str_addr_size + 1); /* URL path */
