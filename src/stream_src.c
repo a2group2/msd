@@ -158,6 +158,23 @@ str_src_timer_proc(str_src_p src, struct timespec *ts_now, struct timespec *ts_p
 		if (0 != (src->s.src_conn_params->tcp.retry_interval)) {
 			tmt = (src->last_recv_time.tv_sec +
 			    (time_t)src->s.src_conn_params->tcp.retry_interval);
+			/* Fast retry for TCP_HTTP sources: the typical case is
+			 * Acestream right after a channel switch - it answers
+			 * 404 ("stream not found yet") or drops/refuses the
+			 * connection while it is fetching the torrent. Waiting
+			 * the full reconnectInterval quantizes recovery to
+			 * N-second steps and makes switching back to a recently
+			 * watched channel feel broken (black screen for many
+			 * seconds). Retry every second for the first 10 error
+			 * cycles, then fall back to the configured
+			 * reconnectInterval. consecutive_errors survives
+			 * reconnects and is reset on success; conn_try grows
+			 * once per reconnect cycle. */
+			if (STR_SRC_TYPE_TCP_HTTP == src->type &&
+			    (0 != src->s.src_conn_params->http.consecutive_errors ||
+			    10 >= src->s.src_conn_params->tcp.conn_try)) {
+				tmt = (src->last_recv_time.tv_sec + 1);
+			}
 			if (tmt > ts_now->tv_sec ||
 			    (tmt == ts_now->tv_sec &&
 			    src->last_recv_time.tv_nsec > ts_now->tv_nsec))
