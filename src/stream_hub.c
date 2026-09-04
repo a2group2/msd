@@ -529,6 +529,7 @@ str_hubs_bckt_timer_service(str_hubs_bckt_p shbskt, str_hub_p str_hub,
 	 * hub/source state, to catch the "server stopped serving an
 	 * already playing stream after a channel switch" problem. */
 	if (0 != str_hub->cli_count &&
+	    0 == str_hub->baud_rate &&
 	    0 == str_hub->sended_count &&
 	    (str_hub->last_starve_report + 5) < ts->tv_sec) {
 		str_src_p src_cur = ((str_hub->src_current < str_hub->src_cnt) ?
@@ -587,10 +588,25 @@ str_hubs_bckt_timer_msg_cb(tpt_p tpt, void *udata) {
 	str_hub_p str_hub, str_hub_temp;
 	str_hubs_stat_t stat;
 	size_t thread_num;
+	struct timespec ts_now;
+	long tm_delay;
 
 	//SYSLOGD_EX(LOG_DEBUG, "...");
 
 	thread_num = tpt_get_num(tpt);
+	/* DEBUG: event loop freeze detector. This message is scheduled to
+	 * fire every second; if it is processed with a big delay, some
+	 * BLOCKING call (DNS resolve, file lock, ...) is stalling this
+	 * thread - every source, hub and client served by it freezes. */
+	clock_gettime(CLOCK_MONOTONIC_FAST, &ts_now);
+	tm_delay = (long)(ts_now.tv_sec - shbskt->last_tmr_time_next.tv_sec);
+	if (2 < tm_delay && 0 != shbskt->last_tmr_time_next.tv_sec) {
+		syslog(LOG_WARNING,
+		    "hub thread %zu: event loop delayed by %ld sec - a "
+		    "blocking operation is stalling all sources and clients "
+		    "on this thread.",
+		    thread_num, tm_delay);
+	}
 	memset(&stat, 0x00, sizeof(str_hubs_stat_t));
 
 	/* Enum all Stream Hubs associated with this thread. */

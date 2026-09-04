@@ -1297,9 +1297,8 @@ str_src_http_redirect_follow(str_src_p src, const uint8_t *location,
     size_t location_size) {
 	str_src_conn_http_p conn_http;
 	str_src_conn_tcp_p conn_tcp;
-	host_addr_p haddr;
 	const uint8_t *host, *path, *ptm, *loc_end;
-	size_t host_size, path_size, i;
+	size_t host_size, path_size;
 	uint8_t host_buf[STR_SRC_HTTP_REDIRECT_HOST_MAX];
 	uint8_t path_buf[STR_SRC_HTTP_REDIRECT_PATH_MAX];
 	sockaddr_storage_t addr;
@@ -1419,10 +1418,9 @@ str_src_http_redirect_follow(str_src_p src, const uint8_t *location,
 	 * Fast path: if the redirect points back to the original host
 	 * (typical for Acestream: same host:port, different path), just
 	 * restore the original address snapshot - no DNS lookup needed.
-	 * Try literal IP[:port] next (no blocking). As the last resort
-	 * fall back to a (blocking) DNS resolve: str_src has no async
-	 * resolver wired in, so a short block here is an accepted
-	 * trade-off, but it must be avoided for the frequent paths. */
+	 * Then try a literal IP[:port] (no blocking). Hostname targets are
+	 * rejected: there is no async resolver and blocking DNS in the IO
+	 * thread would freeze every source and client on this thread. */
 	if (0 != conn_http->orig_addr_count &&
 	    strlen((const char*)host_buf) == strlen(conn_http->orig_url) &&
 	    0 == memcmp(host_buf, conn_http->orig_url,
@@ -1441,22 +1439,20 @@ str_src_http_redirect_follow(str_src_p src, const uint8_t *location,
 			}
 			memcpy(&conn_tcp->addr[0], &addr, sizeof(addr));
 			conn_tcp->addr_count = 1;
-		} else { /* Not a literal address: try DNS resolve. */
-			haddr = host_addr_alloc(host_buf, host_size, def_port);
-			if (NULL == haddr)
-				return (ENOMEM);
-			if (0 != host_addr_resolv(haddr) || 0 == haddr->count) {
-				syslog(LOG_ERR,
-				    "HTTP redirect: cant resolve host: %s", host_buf);
-				host_addr_free(haddr);
-				return (EADDRNOTAVAIL);
-			}
-			for (i = 0; i < haddr->count && i < STR_SRC_CONN_TCP_MAX_ADDRS; i ++) {
-				memcpy(&conn_tcp->addr[i], &haddr->addrs[i],
-				    sizeof(sockaddr_storage_t));
-			}
-			conn_tcp->addr_count = i;
-			host_addr_free(haddr);
+		} else { /* Not a literal address. */
+			/* NOTE: DO NOT resolve DNS here! This code runs in the
+			 * IO thread: a getaddrinfo() stall (DNS timeout = up
+			 * to 30+ sec) freezes ALL sources, hubs and clients
+			 * served by this thread. Acestream redirects point to
+			 * the same host[:port] as the original request (a
+			 * literal address), so a hostname target is
+			 * unexpected: reject it and let the reconnect logic
+			 * retry / revert to the original URL. */
+			syslog(LOG_ERR,
+			    "HTTP redirect: target host is not an IP literal "
+			    "(DNS resolve in IO thread is not supported): %.*s",
+			    (int)host_size, host_buf);
+			return (EADDRNOTAVAIL);
 		}
 	}
 
