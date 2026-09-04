@@ -3,6 +3,7 @@ set(MSD_BIN		msd.c
 			msd_stat_text.c
 			stream_hub.c
 			stream_src.c
+			http_retry_logic.c
 			stream_mpeg2ts.c
 			liblcb/src/net/socket.c
 			liblcb/src/net/socket_address.c

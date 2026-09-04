@@ -96,6 +96,9 @@ typedef struct str_src_conn_http_s {
 	uint8_t		redirect_count;		/* Current redirect depth. */
 	time_t		redirect_expiry;	/* Redirect cache expiration time. */
 	uint8_t		consecutive_errors;	/* Consecutive 5xx error count. */
+	uint8_t		is_original_url;	/* 1 = requesting the original (user-configured) URL, 0 = redirect target. */
+	time_t		last_failure_time;	/* Time of the last 5xx error (error window tracking). */
+	uint32_t	error_window_sec;	/* Window (sec) in which 5xx errors count as consecutive. */
 } str_src_conn_http_t, *str_src_conn_http_p;
 
 /* DVB source (digital TV frontend/demux/dvr, Linux only). */
