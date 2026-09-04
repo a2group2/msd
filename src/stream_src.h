@@ -95,6 +95,11 @@ typedef struct str_src_conn_http_s {
 	char		redirect_chain[STR_SRC_HTTP_MAX_REDIRECTS][512]; /* Redirect history. */
 	uint8_t		redirect_count;		/* Current redirect depth. */
 	time_t		redirect_expiry;	/* Redirect cache expiration time. */
+	/* Snapshot of the original (pre-redirect) resolved addresses, taken
+	 * on the first redirect. Used by revert-to-original instead of a
+	 * (blocking) DNS resolve in the IO thread. */
+	struct sockaddr_storage	orig_addrs[STR_SRC_CONN_TCP_MAX_ADDRS];
+	size_t		orig_addr_count;
 	uint8_t		consecutive_errors;	/* Consecutive 5xx error count. */
 	uint8_t		is_original_url;	/* 1 = requesting the original (user-configured) URL, 0 = redirect target. */
 	time_t		last_failure_time;	/* Time of the last 5xx error (error window tracking). */

@@ -986,6 +986,13 @@ str_src_connect(str_src_p src, int retry) {
 	}
 
 	conn_tcp = &src->s.src_conn_params->tcp;
+	if (0 == conn_tcp->addr_count) {
+		/* No addresses to connect to (e.g. after a failed revert):
+		 * never attempt to connect to a zeroed address - schedule
+		 * a reconnect instead. */
+		error = EADDRNOTAVAIL;
+		goto err_out;
+	}
 	switch (retry) {
 	case 0: /* First connect attempt. */
 		conn_tcp->conn_try = 0;
@@ -998,9 +1005,15 @@ str_src_connect(str_src_p src, int retry) {
 		sa_addr_port_to_str(&conn_tcp->addr[conn_tcp->addr_index], straddr,
 		    sizeof(straddr), NULL);
 		conn_tcp->conn_try ++;
-		/* If the last HTTP response was a 5xx server error, keep retrying
-		 * this address indefinitely (ignore reconnectCount). */
-		if (500 <= src->http_resp_code && src->http_resp_code < 600)
+		/* If the last HTTP response was a 5xx server error (or the
+		 * source is still within a 5xx/404/410 retry session), keep
+		 * retrying this address indefinitely (ignore reconnectCount).
+		 * NOTE: consecutive_errors survives reconnects, while
+		 * http_resp_code does not - so check both. */
+		if ((STR_SRC_TYPE_TCP_HTTP == src->type &&
+		    0 != src->s.src_conn_params->http.consecutive_errors) ||
+		    (500 <= src->http_resp_code && 600 > src->http_resp_code) ||
+		    404 == src->http_resp_code || 410 == src->http_resp_code)
 			conn_tcp->conn_try = 0;
 		syslog(LOG_INFO, "Retry %"PRIu64"/%"PRIu64" connect to %s...",
 		    conn_tcp->conn_try, conn_tcp->conn_try_count, straddr);
@@ -1047,13 +1060,16 @@ str_src_connect(str_src_p src, int retry) {
 	}
 	return (str_src_state_update(src, STR_SRC_STATE_CONNECTING, 0, 0));
 err_out:
-	/* Error: no retry here. */
+	/* Error: do NOT stop the source permanently - schedule an
+	 * automatic reconnect (RECONNECTING state), so the source
+	 * recovers by itself when the server becomes reachable again.
+	 * The old behavior (STOP) left dead sources until a manual
+	 * restart. */
 	close((int)skt);
 	str_src_init(src);
 	src->last_err = error;
-	str_src_state_update(src, STR_SRC_STATE_STOP,
-	    SRC_STATUS_SET_BIT, STR_SRC_STATUS_ERROR);
-	SYSLOG_ERR_EX(LOG_ERR, error, "...");
+	str_src_connect_retry(src);
+	SYSLOG_ERR_EX(LOG_ERR, error, "Connect fail, will retry.");
 	return (error);
 }
 
@@ -1173,10 +1189,11 @@ str_src_connected(tp_task_p tptask, int error, void *arg) {
 	}
 	return (TP_TASK_CB_NONE);
 err_out:
-	/* Error. */
+	/* Error: schedule an automatic reconnect instead of a permanent
+	 * stop, so the source recovers by itself. */
 	SYSLOG_ERR_EX(LOG_ERR, error, "...");
-	str_src_stop(src);
 	src->last_err = error;
+	str_src_connect_retry(src);
 	return (TP_TASK_CB_NONE);
 }
 
@@ -1358,36 +1375,58 @@ str_src_http_redirect_follow(str_src_p src, const uint8_t *location,
 		    "http://%s/%s", conn_http->orig_url, conn_http->orig_path);
 	}
 
+	/* Snapshot the original (pre-redirect) addresses ONCE, before the
+	 * address list is replaced below, so str_src_http_revert_to_orig()
+	 * can restore them without a blocking DNS lookup in the IO thread. */
+	if (0 == conn_http->orig_addr_count && 0 != conn_tcp->addr_count) {
+		memcpy(conn_http->orig_addrs, conn_tcp->addr,
+		    (sizeof(conn_tcp->addr[0]) * conn_tcp->addr_count));
+		conn_http->orig_addr_count = conn_tcp->addr_count;
+	}
+
 	/* Resolve new destination address(es).
-	 * Try literal IP[:port] first (no blocking), then fall back to a
-	 * (blocking) DNS resolve: str_src has no async resolver wired in,
-	 * and redirects are rare one-off events, so a short block here is
-	 * an acceptable trade-off. */
-	memset(&addr, 0x00, sizeof(addr));
-	conn_tcp->addr_count = 0;
-	conn_tcp->addr_index = 0;
-	if (0 == sa_addr_port_from_str(&addr, (const char*)host_buf, host_size)) {
-		if (0 == sa_port_get(&addr)) {
-			sa_port_set(&addr, def_port);
-		}
-		memcpy(&conn_tcp->addr[0], &addr, sizeof(addr));
-		conn_tcp->addr_count = 1;
-	} else { /* Not a literal address: try DNS resolve. */
-		haddr = host_addr_alloc(host_buf, host_size, def_port);
-		if (NULL == haddr)
-			return (ENOMEM);
-		if (0 != host_addr_resolv(haddr) || 0 == haddr->count) {
-			syslog(LOG_ERR,
-			    "HTTP redirect: cant resolve host: %s", host_buf);
+	 * Fast path: if the redirect points back to the original host
+	 * (typical for Acestream: same host:port, different path), just
+	 * restore the original address snapshot - no DNS lookup needed.
+	 * Try literal IP[:port] next (no blocking). As the last resort
+	 * fall back to a (blocking) DNS resolve: str_src has no async
+	 * resolver wired in, so a short block here is an accepted
+	 * trade-off, but it must be avoided for the frequent paths. */
+	if (0 != conn_http->orig_addr_count &&
+	    strlen((const char*)host_buf) == strlen(conn_http->orig_url) &&
+	    0 == memcmp(host_buf, conn_http->orig_url,
+	    strlen(conn_http->orig_url))) {
+		memcpy(conn_tcp->addr, conn_http->orig_addrs,
+		    (sizeof(conn_tcp->addr[0]) * conn_http->orig_addr_count));
+		conn_tcp->addr_count = conn_http->orig_addr_count;
+		conn_tcp->addr_index = 0;
+	} else {
+		memset(&addr, 0x00, sizeof(addr));
+		conn_tcp->addr_count = 0;
+		conn_tcp->addr_index = 0;
+		if (0 == sa_addr_port_from_str(&addr, (const char*)host_buf, host_size)) {
+			if (0 == sa_port_get(&addr)) {
+				sa_port_set(&addr, def_port);
+			}
+			memcpy(&conn_tcp->addr[0], &addr, sizeof(addr));
+			conn_tcp->addr_count = 1;
+		} else { /* Not a literal address: try DNS resolve. */
+			haddr = host_addr_alloc(host_buf, host_size, def_port);
+			if (NULL == haddr)
+				return (ENOMEM);
+			if (0 != host_addr_resolv(haddr) || 0 == haddr->count) {
+				syslog(LOG_ERR,
+				    "HTTP redirect: cant resolve host: %s", host_buf);
+				host_addr_free(haddr);
+				return (EADDRNOTAVAIL);
+			}
+			for (i = 0; i < haddr->count && i < STR_SRC_CONN_TCP_MAX_ADDRS; i ++) {
+				memcpy(&conn_tcp->addr[i], &haddr->addrs[i],
+				    sizeof(sockaddr_storage_t));
+			}
+			conn_tcp->addr_count = i;
 			host_addr_free(haddr);
-			return (EADDRNOTAVAIL);
 		}
-		for (i = 0; i < haddr->count && i < STR_SRC_CONN_TCP_MAX_ADDRS; i ++) {
-			memcpy(&conn_tcp->addr[i], &haddr->addrs[i],
-			    sizeof(sockaddr_storage_t));
-		}
-		conn_tcp->addr_count = i;
-		host_addr_free(haddr);
 	}
 
 	/* Free previous request buffer: a new one is allocated by
@@ -1445,11 +1484,8 @@ static int
 str_src_http_revert_to_orig(str_src_p src) {
 	str_src_conn_http_p conn_http;
 	str_src_conn_tcp_p conn_tcp;
-	host_addr_p haddr;
 	const uint8_t *opath;
-	size_t opath_size, i;
-	sockaddr_storage_t addr;
-	uint16_t def_port;
+	size_t opath_size;
 	int error;
 
 	if (NULL == src || STR_SRC_TYPE_TCP_HTTP != src->type)
@@ -1457,11 +1493,9 @@ str_src_http_revert_to_orig(str_src_p src) {
 
 	conn_http = &src->s.src_conn_params->http;
 	conn_tcp = &conn_http->tcp;
-	if (0 == conn_http->orig_url[0])
-		return (ENOENT); /* No original URL stored: nothing to do. */
-
-	def_port = ((0 != conn_http->orig_port) ?
-	    conn_http->orig_port : HTTP_PORT);
+	if (0 == conn_http->orig_url[0] ||
+	    0 == conn_http->orig_addr_count)
+		return (ENOENT); /* No original URL/addresses stored: nothing to do. */
 
 	/* Skip leading '/': str_src_conn_http_gen_request() adds it back
 	 * via its "GET /" prefix (orig_path is stored with the slash). */
@@ -1488,39 +1522,15 @@ str_src_http_revert_to_orig(str_src_p src) {
 		return (error);
 	}
 
-	/* Re-resolve original destination address(es): literal IP[:port]
-	 * first (no blocking), then (blocking) DNS resolve. */
-	memset(&addr, 0x00, sizeof(addr));
-	conn_tcp->addr_count = 0;
+	/* Restore the original destination addresses from the snapshot
+	 * taken on the first redirect. NOTE: no DNS lookup here - this
+	 * function runs in the IO thread and a blocking getaddrinfo()
+	 * would stall every other source served by that thread. The
+	 * snapshot addresses are the ones resolved at source start. */
+	memcpy(conn_tcp->addr, conn_http->orig_addrs,
+	    (sizeof(conn_tcp->addr[0]) * conn_http->orig_addr_count));
+	conn_tcp->addr_count = conn_http->orig_addr_count;
 	conn_tcp->addr_index = 0;
-	if (0 == sa_addr_port_from_str(&addr,
-	    (const char*)conn_http->orig_url,
-	    strlen(conn_http->orig_url))) {
-		if (0 == sa_port_get(&addr)) {
-			sa_port_set(&addr, def_port);
-		}
-		memcpy(&conn_tcp->addr[0], &addr, sizeof(addr));
-		conn_tcp->addr_count = 1;
-	} else {
-		haddr = host_addr_alloc(
-		    (const uint8_t*)conn_http->orig_url,
-		    strlen(conn_http->orig_url), def_port);
-		if (NULL == haddr)
-			return (ENOMEM);
-		if (0 != host_addr_resolv(haddr) || 0 == haddr->count) {
-			syslog(LOG_ERR,
-			    "HTTP revert: cant resolve host: %s",
-			    conn_http->orig_url);
-			host_addr_free(haddr);
-			return (EADDRNOTAVAIL);
-		}
-		for (i = 0; i < haddr->count && i < STR_SRC_CONN_TCP_MAX_ADDRS; i ++) {
-			memcpy(&conn_tcp->addr[i], &haddr->addrs[i],
-			    sizeof(sockaddr_storage_t));
-		}
-		conn_tcp->addr_count = i;
-		host_addr_free(haddr);
-	}
 
 	/* We are back at the original URL: reset redirect tracking. */
 	conn_http->redirect_count = 0;
@@ -1633,18 +1643,19 @@ err_out:
 			str_src_connect(src, 0);
 			return (TP_TASK_CB_NONE); /* Receiver destroyed. */
 		}
-		/* HTTP server error (5xx): source temporarily unavailable
-		 * (e.g. Acestream engine still starting). Treat as retryable:
-		 * keep reconnecting forever (reconnectInterval apart), ignoring
-		 * reconnectCount exhaustion, so the source comes back as soon
-		 * as the server returns 200. */
-		if (500 <= resp_data.status_code && 600 > resp_data.status_code) {
+		/* HTTP server error (5xx) and Acestream-style 404/410
+		 * ("stream not found yet" - the torrent is still being
+		 * downloaded / no data peers): source temporarily
+		 * unavailable. Treat as retryable: keep reconnecting
+		 * forever (reconnectInterval apart), so the source comes
+		 * back as soon as the server recovers. Track consecutive
+		 * failures within a time window: after 3 failures revert
+		 * to the original (pre-redirect) URL - the redirect may
+		 * be stale. The counter survives reconnects; it is reset
+		 * on success, after a revert, or when the window expires. */
+		if ((500 <= resp_data.status_code && 600 > resp_data.status_code) ||
+		    404 == resp_data.status_code || 410 == resp_data.status_code) {
 			src->http_resp_code = resp_data.status_code;
-			/* Track consecutive 5xx errors within a time window:
-			 * after 3 failures revert to the original (pre-redirect)
-			 * URL - the redirect may be stale. The counter survives
-			 * reconnects; it is reset on success, after a revert,
-			 * or when the error window expires. */
 			http_record_failure(&src->s.src_conn_params->http);
 			if (http_should_revert(&src->s.src_conn_params->http) &&
 			    0 == src->s.src_conn_params->http.is_original_url &&
