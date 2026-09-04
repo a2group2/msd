@@ -483,6 +483,19 @@ str_hubs_bckt_timer_service(str_hubs_bckt_p shbskt, str_hub_p str_hub,
 	size_t j;
 	uint64_t tm64;
 
+	/* Recreate hub if its current source lost the connection: the
+	 * cached stream data is stale, so drop the hub with the cache
+	 * and let the next client request create a fresh hub with a
+	 * fresh source. NOTE: done here (timer context), NOT inside
+	 * the source state callback - destroying the hub from within
+	 * its own callback chain is unsafe. */
+	if (0 != str_hub->recreate_pending) {
+		syslog(LOG_INFO, "%s: dropping stale cache and recreating "
+		    "hub with a fresh source.", str_hub->name);
+		str_hub_destroy(str_hub);
+		return;
+	}
+
 	/* Disconnect timedout clients. */
 	if (0 != str_hub->s.skt_opts.snd_timeout) {
 		TAILQ_FOREACH_SAFE(strh_cli, &str_hub->cli_head, next, strh_cli_temp) {
@@ -700,6 +713,7 @@ str_hub_create(str_hubs_bckt_p shbskt, tpt_p tpt,
 	//str_hub->cli_count = 0;
 	str_hub->zero_cli_time = gettime_monotonic();
 	str_hub->last_starve_report = str_hub->zero_cli_time;
+	str_hub->recreate_pending = 0;
 	str_hub->tpt = tpt;
 	//str_hub->src = NULL;
 	//str_hub->src_cnt = 0;
@@ -1704,12 +1718,30 @@ str_hub_src_on_state(str_src_p src, void *udata, uint32_t state, uint32_t status
 
 	switch (state) {
 	case STR_SRC_STATE_STOP:
+	case STR_SRC_STATE_RECONNECTING:
+		/* The current source lost its connection (or died): the
+		 * cached stream data in the ring buffer is stale now.
+		 * Mark the hub for recreation: the timer will destroy it
+		 * (with the cache) and the next client request will create
+		 * a fresh hub with a fresh source. This way a persistent
+		 * hub (fZeroCliPersistent=yes) serves the cache only while
+		 * the source connection is continuous. */
+		if (src_current == str_hub->src_current &&
+		    0 == str_hub->recreate_pending) {
+			str_hub->recreate_pending = 1;
+			syslog(LOG_INFO,
+			    "%s: source %s - hub marked for recreation "
+			    "(cached stream is stale).",
+			    str_hub->name,
+			    ((STR_SRC_STATE_STOP == state) ?
+			    "stopped" : "reconnecting"));
+		}
+		break;
 	case STR_SRC_STATE_RUNNING:
 	case STR_SRC_STATE_MONITORING:
 	case STR_SRC_STATE_CONNECTING:
 	case STR_SRC_STATE_DATA_REQ:
 	case STR_SRC_STATE_DATA_WAITING:
-	case STR_SRC_STATE_RECONNECTING:
 		break;
 	case STR_SRC_STATE_CURRENT:
 		break;

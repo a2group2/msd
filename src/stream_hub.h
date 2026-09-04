@@ -167,6 +167,7 @@ typedef struct str_hub_s {
 	/* -- stat */
 	time_t		zero_cli_time;	/* No connected clients time. */
 	time_t		last_starve_report; /* Last "hub starving" debug report. */
+	int		recreate_pending; /* Current source lost connection: drop hub + cache, recreate on next request. */
 	tpt_p		tpt;		/* Thread data for all IO operations. */
 	str_src_p	src[STR_HUB_SRC_MAX_CNT];	/* Data sources. */
 	size_t		src_cnt;	/* Data sources count. */
