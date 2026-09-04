@@ -1159,15 +1159,17 @@ str_hub_send_to_client(str_hub_cli_p strh_cli, struct timespec *ts,
 	data_avail2send = 0;
 	if (NULL == str_hub->src[str_hub->src_current])
 		goto send_done;
-	r_buf_fd = str_hub->src[str_hub->src_current]->r_buf_fd;
-	r_buf = str_hub->src[str_hub->src_current]->r_buf;
-	if (NULL == r_buf)
-		goto send_done;
 	thr_data = &str_hub->shbskt->thr_data[tpt_get_num(str_hub->tpt)];
 	ident = tp_task_ident_get(strh_cli->tptask);
 
 send_start:
-	/* Send HTTP headers if needed. */
+	/* Send HTTP headers if needed. NOTE: headers must be sent even when
+	 * the current source has no data yet (no r_buf: the source is
+	 * connecting/reconnecting or the upstream is slow to start, e.g.
+	 * Acestream is fetching a torrent after a channel switch). Sending
+	 * the response headers early keeps the client's request alive;
+	 * without this players time out waiting for a response and never
+	 * retry, so the stream "never starts". */
 	if (0 == (STR_HUB_CLI_STATE_F_HTTP_HDRS_SENDED & strh_cli->state) &&
 	    STR_HUB_CLI_T_TCP_HTTP == strh_cli->cli_type) {
 		error = str_hub_cli_send_http_hdr(str_hub->shbskt,
@@ -1189,6 +1191,10 @@ send_start:
 		if (STR_HUB_CLI_ST_TCP_HTTP_HEAD == strh_cli->cli_sub_type)
 			return (-1); /* Destroy me. */
 	}
+	r_buf_fd = str_hub->src[str_hub->src_current]->r_buf_fd;
+	r_buf = str_hub->src[str_hub->src_current]->r_buf;
+	if (NULL == r_buf)
+		goto send_done;
 	/* Send MPEG2-TS DVB PIDs data. */
 	if (0 == (STR_HUB_CLI_STATE_F_MPEG2TS_HDRS_SENDED & strh_cli->state) &&
 	    0 != (STR_SRC_S_F_M2TS_ANALYZING & str_hub->src[str_hub->src_current]->s.flags) &&
@@ -1479,8 +1485,23 @@ str_hub_src_add(str_hub_p str_hub, uint32_t type, str_src_settings_p s) {
 	if (0 == str_hub->src_cnt) { /* Auto start first source. */
 		error = str_src_start(src);
 		if (0 != error && EALREADY != error) {
-			str_src_destroy(src);
-			return (error);
+			/* NOTE: for TCP/TCP_HTTP sources str_src_start() can
+			 * fail on a transient error (the upstream is not
+			 * accepting connections right now - typical right
+			 * after a channel switch). Such a source is left in
+			 * RECONNECTING state and will retry by itself, so
+			 * keep it in the hub: destroying it left the hub with
+			 * zero sources (or destroyed the whole hub with the
+			 * attached client), so the stream "never started". */
+			if (STR_SRC_TYPE_TCP != type &&
+			    STR_SRC_TYPE_TCP_HTTP != type) {
+				str_src_destroy(src);
+				return (error);
+			}
+			syslog(LOG_WARNING,
+			    "%s: source start fail (error %i), source left "
+			    "in reconnecting state.", str_hub->name, error);
+			error = 0;
 		}
 		str_hub->src_current = 0;
 	}

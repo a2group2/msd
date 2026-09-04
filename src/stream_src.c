@@ -1002,6 +1002,12 @@ str_src_connect(str_src_p src, int retry) {
 		syslog(LOG_INFO, "Connecting to %s...", straddr);
 		break;
 	case 1:  /* Retry connect to selected addr. */
+		if (conn_tcp->addr_index >= conn_tcp->addr_count) {
+			/* Stale out-of-range index (should not happen):
+			 * restart the attempt cycle from the first addr. */
+			conn_tcp->addr_index = 0;
+			conn_tcp->conn_try = 0;
+		}
 		sa_addr_port_to_str(&conn_tcp->addr[conn_tcp->addr_index], straddr,
 		    sizeof(straddr), NULL);
 		conn_tcp->conn_try ++;
@@ -1025,6 +1031,12 @@ str_src_connect(str_src_p src, int retry) {
 		conn_tcp->addr_index ++;
 		if (conn_tcp->addr_index >= conn_tcp->addr_count) {
 			syslog(LOG_INFO, "Cant connect.");
+			/* Reset the attempt cycle, so the next reconnect
+			 * starts from the first address: leaving addr_index
+			 * out of range made all further retries use a
+			 * zeroed/garbage address slot forever. */
+			conn_tcp->addr_index = 0;
+			conn_tcp->conn_try = 0;
 			error = EADDRNOTAVAIL;
 			goto err_out;
 		}
@@ -1139,6 +1151,8 @@ str_src_connected(tp_task_p tptask, int error, void *arg) {
 		str_src_conn_tcp_p conn_tcp;
 
 		conn_tcp = &src->s.src_conn_params->tcp;
+		if (conn_tcp->addr_count <= conn_tcp->addr_index)
+			conn_tcp->addr_index = 0; /* Clamp stale index. */
 		if (0 == sa_addr_port_to_str(
 		    &conn_tcp->addr[conn_tcp->addr_index],
 		    straddr, sizeof(straddr), NULL)) {
