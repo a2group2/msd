@@ -188,6 +188,7 @@ uint32_t msd_http_req_url_parse(int type, http_srv_req_p req,
 	    const uint8_t **str_addr, size_t *str_addr_size,
 	    sockaddr_storage_p ssaddr,
 	    uint32_t *if_index, uint32_t *rejoin_time,
+	    int *if_index_explicit,
 	    uint8_t *hub_name, size_t hub_name_size,
 	    size_t *hub_name_size_ret);
 #define REQ_URL_TYPE_UDP	1
@@ -1279,6 +1280,7 @@ uint32_t
 msd_http_req_url_parse(int type, http_srv_req_p req,
     const uint8_t **str_addr, size_t *str_addr_size, sockaddr_storage_p ssaddr,
     uint32_t *if_index, uint32_t *rejoin_time,
+    int *if_index_explicit,
     uint8_t *hub_name, size_t hub_name_size, size_t *hub_name_size_ret) {
 	const uint8_t *ptm;
 	size_t tm = 0, tm2;
@@ -1288,6 +1290,8 @@ msd_http_req_url_parse(int type, http_srv_req_p req,
 
 	SYSLOGD_EX(LOG_DEBUG, "...");
 
+	if (NULL != if_index_explicit)
+		(*if_index_explicit) = 0;
 	if (NULL == req || NULL == hub_name || 0 == hub_name_size)
 		return (500);
 	switch (type) {
@@ -1305,11 +1309,15 @@ msd_http_req_url_parse(int type, http_srv_req_p req,
 			memcpy(ifname, ptm, tm);
 			ifname[tm] = 0;
 			ifindex = if_nametoindex(ifname);
+			if (NULL != if_index_explicit)
+				(*if_index_explicit) = 1; /* Explicit in URL. */
 		} else {
-			if (0 == http_query_val_get(req->line.query, 
+			if (0 == http_query_val_get(req->line.query,
 			    req->line.query_size, (uint8_t*)"ifindex", 7,
 			    &ptm, &tm)) {
 				ifindex = ustr2u32(ptm, tm);
+				if (NULL != if_index_explicit)
+					(*if_index_explicit) = 1; /* Explicit in URL. */
 			} else { /* Default value. */
 				if (NULL != if_index) {
 					ifindex = (*if_index);
@@ -1655,6 +1663,7 @@ err_out_dyn_client:
 		/* Default value. */
 		memcpy(src_conn_params, &prog_service->src_conn_params, sizeof(str_src_conn_params_t));
 		if (STR_SRC_TYPE_MULTICAST == src_type) {
+			int if_explicit = 0;
 			/* Get multicast address, ifindex, hub name. */
 			resp->status_code = msd_http_req_url_parse(
 			    REQ_URL_TYPE_UDP, req,
@@ -1662,6 +1671,7 @@ err_out_dyn_client:
 			    &src_conn_params->udp.addr,
 			    &src_conn_params->mc.if_index,
 			    &src_conn_params->mc.rejoin_time,
+			    &if_explicit,
 			    buf, sizeof(buf), &buf_size);
 			if (200 != resp->status_code)
 				goto err_out_dyn_client;
@@ -1679,7 +1689,16 @@ err_out_dyn_client:
 				    sizeof(str_src_conn_params_t));
 				/* Restore parsed destination. */
 				memcpy(&src_conn_params->udp.addr, &routed_dst, sizeof(routed_dst));
-				src_conn_params->mc.if_index = mc_if_index;
+				/* Restore the route profile's interface: without an
+				 * explicit ifname=/ifindex= in the URL the parsed
+				 * value is inherited from the DEFAULT profile, and
+				 * restoring it here silently overrode the
+				 * route-selected profile's interface - all sources
+				 * were bound to the default interface. Only an
+				 * explicitly requested interface wins. */
+				if (0 != if_explicit) {
+					src_conn_params->mc.if_index = mc_if_index;
+				}
 				src_conn_params->mc.rejoin_time = mc_rejoin;
 			}
 		} else {
@@ -1689,6 +1708,7 @@ err_out_dyn_client:
 			    &str_addr, &str_addr_size,
 			    &src_conn_params->tcp.addr[0],
 			    NULL, NULL,
+			    NULL,
 			    buf, sizeof(buf), &buf_size);
 			if (200 != resp->status_code)
 				goto err_out_dyn_client;
