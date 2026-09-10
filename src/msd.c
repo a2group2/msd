@@ -1701,6 +1701,26 @@ err_out_dyn_client:
 				}
 				src_conn_params->mc.rejoin_time = mc_rejoin;
 			}
+			/* Regenerate the hub name with the ACTUAL interface:
+			 * msd_http_req_url_parse() built it from the default
+			 * profile's interface (routes are applied after the
+			 * URL parse), so without this the log/stat showed a
+			 * wrong interface. The hub name is also the hub
+			 * identity, so it must reflect the final settings. */
+			{
+				char straddr2[STR_ADDR_LEN];
+				char ifname2[(IFNAMSIZ + 1)];
+
+				ifname2[0] = 0;
+				if_indextoname(src_conn_params->mc.if_index, ifname2);
+				if (0 == sa_addr_port_to_str(
+				    &src_conn_params->udp.addr,
+				    straddr2, sizeof(straddr2), NULL)) {
+					buf_size = (size_t)snprintf((char*)buf,
+					    sizeof(buf), "/udp/%s@%s",
+					    straddr2, ifname2);
+				}
+			}
 		} else {
 			/* Get dst ip address, host name, hub name. */
 			resp->status_code = msd_http_req_url_parse(

@@ -76,6 +76,7 @@ typedef struct str_hubs_bckt_s {
 	struct timespec	last_tmr_time_next; /* For baud rate calculation. */
 	tp_udata_t	service_tmr;	/* Service timer. */
 	str_hub_thrd_p	thr_data;	/* Per thread hubs + stat. */
+	time_t		last_thr_stat_report; /* Last per-thread load report. */
 	size_t		base_http_hdrs_size;
 	uint8_t		base_http_hdrs[512];
 } str_hubs_bckt_t;
@@ -641,6 +642,39 @@ str_hubs_bckt_timer_cb(tp_event_p ev __unused, tp_udata_p tp_udata) {
 	memcpy(&shbskt->last_tmr_time, &shbskt->last_tmr_time_next,
 	    sizeof(struct timespec));
 	clock_gettime(CLOCK_MONOTONIC_FAST, &shbskt->last_tmr_time_next);
+	/* DEBUG: per-thread load report (once per 60 sec). Reads other
+	 * threads' stat counters (relaxed sync is fine for logging) to
+	 * show how hubs / sources / clients / traffic are distributed
+	 * across the thread pool. If everything piles up on thread 0
+	 * while other threads are idle - the balancer or the kernel
+	 * softirq affinity is the problem. */
+	if ((shbskt->last_thr_stat_report + 60) <
+	    shbskt->last_tmr_time_next.tv_sec) {
+		size_t thread_cnt = tp_thread_count_max_get(shbskt->tp);
+		size_t thread_num, offs = 0;
+		char lbuf[2048];
+
+		shbskt->last_thr_stat_report = shbskt->last_tmr_time_next.tv_sec;
+		lbuf[0] = 0;
+		for (thread_num = 0;
+		    thread_num < thread_cnt && (offs + 128) < sizeof(lbuf);
+		    thread_num ++) {
+			str_hubs_stat_p ts = &shbskt->thr_data[thread_num].stat;
+
+			if (0 == ts->str_hub_count)
+				continue; /* Skip idle threads. */
+			offs += (size_t)snprintf((lbuf + offs),
+			    (sizeof(lbuf) - offs),
+			    "%st%zu: hubs=%zu srcs=%zu cli=%zu "
+			    "in=%"PRIu64"kbps out=%"PRIu64"kbps",
+			    ((0 != offs) ? "; " : ""),
+			    thread_num, ts->str_hub_count, ts->srcs_cnt,
+			    ts->cli_count,
+			    (ts->baud_rate_in / 1024),
+			    (ts->baud_rate_out / 1024));
+		}
+		syslog(LOG_INFO, "hub threads load: %s.", lbuf);
+	}
 	/* Broadcast to all threads. */
 	tpt_msg_bsend(shbskt->tp, tp_udata->tpt,
 	    TP_MSG_F_SELF_DIRECT, str_hubs_bckt_timer_msg_cb, shbskt);
@@ -722,7 +756,8 @@ str_hub_create(str_hubs_bckt_p shbskt, tpt_p tpt,
 	TAILQ_INSERT_HEAD(&shbskt->thr_data[tpt_get_num(tpt)].hub_head,
 	    str_hub, next);
 
-	syslog(LOG_INFO, "%s: Created.", str_hub->name);
+	syslog(LOG_INFO, "%s: Created (thread %zu).",
+	    str_hub->name, tpt_get_num(tpt));
 
 	(*str_hub_ret) = str_hub;
 	return (0);
